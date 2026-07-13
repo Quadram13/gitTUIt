@@ -54,6 +54,7 @@ impl App {
         self.pending_pr_title = None;
         self.input_mode = InputMode::CreatePullRequestTitle;
         self.input_buffer.clear();
+        self.move_input_cursor_home();
         self.status_message = "Enter PR title and press [Enter]".to_string();
     }
 

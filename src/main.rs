@@ -92,6 +92,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
                     KeyCode::Esc => app.cancel_input(),
                     KeyCode::Enter => action_result = Some(app.submit_input()),
                     KeyCode::Backspace => app.pop_input_char(),
+                    KeyCode::Delete => app.delete_input_char(),
+                    KeyCode::Left => app.move_input_cursor_left(),
+                    KeyCode::Right => app.move_input_cursor_right(),
+                    KeyCode::Home => app.move_input_cursor_home(),
+                    KeyCode::End => app.move_input_cursor_end(),
                     KeyCode::Tab => action_result = Some(app.autocomplete_input()),
                     KeyCode::Char(ch) => app.push_input_char(ch),
                     _ => {}

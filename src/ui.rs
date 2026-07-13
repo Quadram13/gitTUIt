@@ -1,8 +1,8 @@
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style, Stylize},
-    text::{Line, Text},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
@@ -726,7 +726,8 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_commit_popup(frame: &mut Frame, app: &App) {
     let popup = centered_rect(70, 18, frame.area());
     frame.render_widget(Clear, popup);
-    let input = Paragraph::new(app.popup_body())
+    let popup_text = popup_text_with_cursor(app);
+    let input = Paragraph::new(popup_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -734,6 +735,51 @@ fn draw_commit_popup(frame: &mut Frame, app: &App) {
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(input, popup);
+}
+
+fn popup_text_with_cursor(app: &App) -> Text<'static> {
+    let Some(input) = app.popup_input_text() else {
+        return Text::from(app.popup_body());
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if let Some(prefix) = app.popup_input_prefix() {
+        if !prefix.is_empty() {
+            for line in prefix.split('\n') {
+                lines.push(Line::from(line.to_string()));
+            }
+        }
+    }
+
+    let chars = input.chars().collect::<Vec<_>>();
+    let cursor = app.popup_input_cursor().min(chars.len());
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (idx, ch) in chars.iter().enumerate() {
+        if idx == cursor {
+            spans.push(Span::styled(
+                ch.to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+        } else {
+            spans.push(Span::raw(ch.to_string()));
+        }
+    }
+    if cursor == chars.len() {
+        spans.push(Span::styled(
+            " ".to_string(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(
+            " ".to_string(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+    }
+
+    lines.push(Line::from(spans));
+    Text::from(lines)
 }
 
 fn draw_help_popup(frame: &mut Frame, app: &App) {

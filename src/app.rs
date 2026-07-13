@@ -84,6 +84,7 @@ pub struct App {
     pub selected_staged: usize,
     pub status_message: String,
     pub input_buffer: String,
+    input_cursor: usize,
     pub help_visible: bool,
     pub help_scroll: usize,
     last_fetch_at: Option<SystemTime>,
@@ -153,6 +154,7 @@ impl App {
             selected_staged: 0,
             status_message: String::new(),
             input_buffer: String::new(),
+            input_cursor: 0,
             help_visible: false,
             help_scroll: 0,
             last_fetch_at: None,
@@ -643,6 +645,7 @@ impl App {
     pub fn begin_add_repo_input(&mut self) {
         self.input_mode = InputMode::AddRepoPath;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.status_message = "Enter repository root path containing .git".to_string();
     }
 
@@ -693,6 +696,7 @@ impl App {
         }
         self.input_mode = InputMode::CommitMessage;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.status_message = "Enter commit message and press [Enter]".to_string();
     }
 
@@ -700,6 +704,7 @@ impl App {
         self.screen = Screen::RepoView;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.clear_history_details();
         self.clear_stash_details();
         self.clear_pr_status_summary();
@@ -717,6 +722,7 @@ impl App {
         let was_pr_merge_confirmation = self.input_mode == InputMode::ConfirmPullRequestMerge;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.pending_stash_drop = None;
         self.pending_discard = None;
         self.pending_pr_merge = None;
@@ -733,11 +739,60 @@ impl App {
     }
 
     pub fn push_input_char(&mut self, ch: char) {
-        self.input_buffer.push(ch);
+        self.insert_input_char(ch);
     }
 
     pub fn pop_input_char(&mut self) {
-        self.input_buffer.pop();
+        self.delete_input_char_before_cursor();
+    }
+
+    pub fn delete_input_char(&mut self) {
+        let mut chars = self.input_buffer.chars().collect::<Vec<_>>();
+        if self.input_cursor >= chars.len() {
+            return;
+        }
+        chars.remove(self.input_cursor);
+        self.input_buffer = chars.into_iter().collect();
+    }
+
+    pub fn move_input_cursor_left(&mut self) {
+        self.input_cursor = self.input_cursor.saturating_sub(1);
+    }
+
+    pub fn move_input_cursor_right(&mut self) {
+        let len = self.input_buffer.chars().count();
+        self.input_cursor = min(self.input_cursor + 1, len);
+    }
+
+    pub fn move_input_cursor_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    pub fn move_input_cursor_end(&mut self) {
+        self.input_cursor = self.input_buffer.chars().count();
+    }
+
+    fn insert_input_char(&mut self, ch: char) {
+        let mut chars = self.input_buffer.chars().collect::<Vec<_>>();
+        if self.input_cursor > chars.len() {
+            self.input_cursor = chars.len();
+        }
+        chars.insert(self.input_cursor, ch);
+        self.input_cursor += 1;
+        self.input_buffer = chars.into_iter().collect();
+    }
+
+    fn delete_input_char_before_cursor(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let mut chars = self.input_buffer.chars().collect::<Vec<_>>();
+        if self.input_cursor > chars.len() {
+            self.input_cursor = chars.len();
+        }
+        chars.remove(self.input_cursor - 1);
+        self.input_cursor -= 1;
+        self.input_buffer = chars.into_iter().collect();
     }
 
     pub fn submit_input(&mut self) -> Result<()> {
@@ -961,6 +1016,7 @@ impl App {
         self.last_fetch_at = None;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.pending_stash_drop = None;
         self.pending_discard = None;
         self.pending_pr_merge = None;
@@ -1115,6 +1171,35 @@ impl App {
         }
     }
 
+    pub fn popup_input_text(&self) -> Option<&str> {
+        match self.input_mode {
+            InputMode::CommitMessage
+            | InputMode::AddRepoPath
+            | InputMode::NewBranchName
+            | InputMode::CreatePullRequestTitle
+            | InputMode::CreatePullRequestBody => Some(&self.input_buffer),
+            _ => None,
+        }
+    }
+
+    pub fn popup_input_prefix(&self) -> Option<String> {
+        match self.input_mode {
+            InputMode::CreatePullRequestBody => {
+                let title = self.pending_pr_title.as_deref().unwrap_or("(missing title)");
+                Some(format!("Title: {title}\n\n"))
+            }
+            InputMode::CommitMessage
+            | InputMode::AddRepoPath
+            | InputMode::NewBranchName
+            | InputMode::CreatePullRequestTitle => Some(String::new()),
+            _ => None,
+        }
+    }
+
+    pub fn popup_input_cursor(&self) -> usize {
+        self.input_cursor
+    }
+
     pub fn popup_body(&self) -> String {
         match self.input_mode {
             InputMode::ConfirmStashDrop => {
@@ -1158,6 +1243,10 @@ impl App {
                     self.input_buffer.clone()
                 }
             }
+            InputMode::CommitMessage
+            | InputMode::AddRepoPath
+            | InputMode::NewBranchName
+            | InputMode::CreatePullRequestTitle => self.input_buffer.clone(),
             _ => self.input_buffer.clone(),
         }
     }
@@ -1172,6 +1261,7 @@ impl App {
         git::commit(&root, message)?;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.refresh()?;
         self.status_message = "Commit created".to_string();
         Ok(())
@@ -1192,6 +1282,7 @@ impl App {
         }
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.status_message = format!(
             "Added repository {}",
             display_path_for_ui(&canonical.to_string_lossy())
@@ -1208,6 +1299,7 @@ impl App {
         self.pending_pr_title = Some(title.to_string());
         self.input_mode = InputMode::CreatePullRequestBody;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.status_message = "Enter PR body (optional), then press [Enter]".to_string();
         Ok(())
     }
@@ -1216,6 +1308,7 @@ impl App {
         let Some(title) = self.pending_pr_title.take() else {
             self.input_mode = InputMode::None;
             self.input_buffer.clear();
+            self.input_cursor = 0;
             self.status_message = "PR title is missing; start PR creation again".to_string();
             return Ok(());
         };
@@ -1223,6 +1316,7 @@ impl App {
         let body = self.input_buffer.trim().to_string();
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
 
         let root = self.current_repo_root()?.to_path_buf();
         match git::create_pull_request(&root, &title, &body) {
@@ -1303,6 +1397,7 @@ impl App {
             completed.push(std::path::MAIN_SEPARATOR);
         }
         self.input_buffer = completed;
+        self.input_cursor = self.input_buffer.chars().count();
 
         if names.len() == 1 {
             self.status_message = "Autocomplete applied (single match).".to_string();
@@ -1334,9 +1429,9 @@ impl App {
         self.tracking_summary = None;
         self.stash_entries.clear();
         self.selected_stash = 0;
-        self.last_fetch_at = None;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.input_cursor = 0;
         self.clear_history_details();
         self.clear_stash_details();
         self.pending_stash_drop = None;

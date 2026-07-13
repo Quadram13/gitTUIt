@@ -36,6 +36,7 @@ impl App {
         }
         self.input_mode = InputMode::NewBranchName;
         self.input_buffer.clear();
+        self.move_input_cursor_home();
         self.status_message = "Enter new branch name and press [Enter]".to_string();
     }
 
@@ -87,6 +88,7 @@ impl App {
         git::create_and_switch_branch(&root, &branch_name)?;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
+        self.move_input_cursor_home();
         self.snapshot = git::snapshot(&root)?;
         self.refresh_branch_entries()?;
         self.return_to_repo_view();

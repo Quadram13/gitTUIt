@@ -101,11 +101,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
                     KeyCode::F(2) if app.input_mode_allows_multiline() => {
                         action_result = Some(app.submit_input())
                     }
+                    KeyCode::Char('s')
+                        if app.input_mode_allows_multiline()
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        action_result = Some(app.submit_input())
+                    }
                     KeyCode::Enter => action_result = Some(app.submit_input()),
                     KeyCode::Backspace => app.pop_input_char(),
                     KeyCode::Delete => app.delete_input_char(),
                     KeyCode::Left => app.move_input_cursor_left(),
                     KeyCode::Right => app.move_input_cursor_right(),
+                    KeyCode::Up if app.input_mode_allows_multiline() => app.move_input_cursor_up(),
+                    KeyCode::Down if app.input_mode_allows_multiline() => {
+                        app.move_input_cursor_down()
+                    }
                     KeyCode::Home => app.move_input_cursor_home(),
                     KeyCode::End => app.move_input_cursor_end(),
                     KeyCode::Tab => action_result = Some(app.autocomplete_input()),

@@ -866,6 +866,45 @@ impl App {
         self.input_cursor = self.input_buffer.chars().count();
     }
 
+    pub fn move_input_cursor_up(&mut self) {
+        let chars = self.input_buffer.chars().collect::<Vec<_>>();
+        if chars.is_empty() || self.input_cursor == 0 {
+            return;
+        }
+        let cursor = self.input_cursor.min(chars.len());
+        let current_start = line_start_before_or_at(&chars, cursor);
+        if current_start == 0 {
+            self.input_cursor = 0;
+            return;
+        }
+
+        let current_col = cursor.saturating_sub(current_start);
+        let prev_end = current_start.saturating_sub(1);
+        let prev_start = line_start_before_or_at(&chars, prev_end);
+        let prev_len = prev_end.saturating_sub(prev_start);
+        self.input_cursor = prev_start + min(current_col, prev_len);
+    }
+
+    pub fn move_input_cursor_down(&mut self) {
+        let chars = self.input_buffer.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            return;
+        }
+        let cursor = self.input_cursor.min(chars.len());
+        let current_start = line_start_before_or_at(&chars, cursor);
+        let current_end = line_end_from(&chars, current_start);
+        if current_end >= chars.len() {
+            self.input_cursor = chars.len();
+            return;
+        }
+
+        let current_col = cursor.saturating_sub(current_start);
+        let next_start = current_end + 1;
+        let next_end = line_end_from(&chars, next_start);
+        let next_len = next_end.saturating_sub(next_start);
+        self.input_cursor = next_start + min(current_col, next_len);
+    }
+
     fn insert_input_char(&mut self, ch: char) {
         let mut chars = self.input_buffer.chars().collect::<Vec<_>>();
         if self.input_cursor > chars.len() {
@@ -1252,7 +1291,7 @@ impl App {
         match self.input_mode {
             InputMode::CommitSubject => "Commit subject ([Enter] next, [Esc] cancel)",
             InputMode::CommitBody => {
-                "Commit body ([Enter] newline, [Ctrl+Enter]/[F2] submit, [Esc] cancel)"
+                "Commit body ([Enter] newline, [Up/Down] lines, [Ctrl+S]/[F2] submit, [Esc] cancel)"
             }
             InputMode::AddRepoPath => "Add repository path ([Enter] submit, [Esc] cancel)",
             InputMode::NewBranchName => "New branch name ([Enter] create/switch, [Esc] cancel)",
@@ -1374,7 +1413,7 @@ impl App {
         self.input_mode = InputMode::CommitBody;
         self.input_buffer.clear();
         self.input_cursor = 0;
-        self.status_message = "Enter commit body (optional), [Ctrl+Enter] or [F2] to commit".to_string();
+        self.status_message = "Enter commit body (optional), [Ctrl+S] or [F2] to commit".to_string();
         Ok(())
     }
 
@@ -1969,6 +2008,24 @@ impl App {
 
 fn truncate_lines(input: String, max_lines: usize) -> String {
     input.lines().take(max_lines).collect::<Vec<_>>().join("\n")
+}
+
+fn line_start_before_or_at(chars: &[char], cursor: usize) -> usize {
+    let upto = cursor.min(chars.len());
+    for idx in (0..upto).rev() {
+        if chars[idx] == '\n' {
+            return idx + 1;
+        }
+    }
+    0
+}
+
+fn line_end_from(chars: &[char], start: usize) -> usize {
+    let mut idx = start.min(chars.len());
+    while idx < chars.len() && chars[idx] != '\n' {
+        idx += 1;
+    }
+    idx
 }
 
 fn pull_request_merge_method_label(method: GitPullRequestMergeMethod) -> &'static str {

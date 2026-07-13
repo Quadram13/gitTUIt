@@ -12,7 +12,7 @@ use diagnostics::{doctor_report, initialize_logging, parse_runtime_options};
 use git::PullRequestMergeMethod;
 use log::error;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -51,9 +51,10 @@ fn main() -> Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        app.tick();
         terminal.draw(|frame| ui::draw(frame, app))?;
 
-        if !event::poll(Duration::from_millis(100))? {
+        if !event::poll(Duration::from_millis(35))? {
             continue;
         }
 
@@ -90,6 +91,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
                 },
                 _ => match key.code {
                     KeyCode::Esc => app.cancel_input(),
+                    KeyCode::Enter
+                        if app.input_mode_allows_multiline()
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        action_result = Some(app.submit_input())
+                    }
+                    KeyCode::Enter if app.input_mode_allows_multiline() => app.push_input_char('\n'),
+                    KeyCode::F(2) if app.input_mode_allows_multiline() => {
+                        action_result = Some(app.submit_input())
+                    }
                     KeyCode::Enter => action_result = Some(app.submit_input()),
                     KeyCode::Backspace => app.pop_input_char(),
                     KeyCode::Delete => app.delete_input_char(),
@@ -240,10 +251,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
             KeyCode::Char('f') if app.screen == Screen::RepoView => {
                 action_result = Some(app.fetch_remotes())
             }
+            KeyCode::Char('f') if app.screen == Screen::TrackingStatusView => {
+                action_result = Some(app.fetch_remotes())
+            }
             KeyCode::Char('l') if app.screen == Screen::RepoView => {
                 action_result = Some(app.pull_current_branch())
             }
+            KeyCode::Char('l') if app.screen == Screen::TrackingStatusView => {
+                action_result = Some(app.pull_current_branch())
+            }
             KeyCode::Char('p') if app.screen == Screen::RepoView => {
+                action_result = Some(app.push_current_branch())
+            }
+            KeyCode::Char('p') if app.screen == Screen::TrackingStatusView => {
                 action_result = Some(app.push_current_branch())
             }
             KeyCode::Char('v') if app.screen == Screen::RepoView => {

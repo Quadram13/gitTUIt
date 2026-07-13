@@ -2,7 +2,7 @@ use std::{
     cmp::min,
     fs,
     path::{Path, PathBuf},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Result, anyhow};
@@ -48,7 +48,8 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     None,
-    CommitMessage,
+    CommitSubject,
+    CommitBody,
     AddRepoPath,
     NewBranchName,
     CreatePullRequestTitle,
@@ -97,11 +98,17 @@ pub struct App {
     history_details_for: Option<String>,
     pr_status_summary: Option<GitPullRequestStatusSummary>,
     pr_status_for: Option<u64>,
+    pr_status_refresh_deadline: Option<Instant>,
+    pr_status_pending_for: Option<u64>,
     pending_discard: Option<PendingDiscard>,
     pending_pr_merge: Option<PendingPullRequestMerge>,
     pending_stash_drop: Option<String>,
     pending_pr_title: Option<String>,
+    pending_commit_subject: Option<String>,
     runtime_log_path: Option<PathBuf>,
+    repo_preview_key: Option<String>,
+    repo_preview_text: String,
+    repo_preview_refresh_deadline: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,11 +174,17 @@ impl App {
             history_details_for: None,
             pr_status_summary: None,
             pr_status_for: None,
+            pr_status_refresh_deadline: None,
+            pr_status_pending_for: None,
             pending_discard: None,
             pending_pr_merge: None,
             pending_stash_drop: None,
             pending_pr_title: None,
+            pending_commit_subject: None,
             runtime_log_path: None,
+            repo_preview_key: None,
+            repo_preview_text: "No unstaged diff output for selected file.".to_string(),
+            repo_preview_refresh_deadline: None,
         };
         app.rebuild_repo_picker_labels();
         app.refresh_browser_entries()?;
@@ -199,6 +212,11 @@ impl App {
 
     pub fn in_input_mode(&self) -> bool {
         self.input_mode != InputMode::None
+    }
+
+    pub fn tick(&mut self) {
+        self.maybe_refresh_pr_status_summary();
+        self.maybe_refresh_repo_preview_cache();
     }
 
     pub fn has_open_repo(&self) -> bool {
@@ -322,120 +340,176 @@ impl App {
     }
 
     fn help_lines(&self) -> Vec<String> {
-        let lines: &[&str] = match self.screen {
-            Screen::RepoPicker => &[
-                "[j]/[k] move selection",
-                "[Enter] open selected repo",
-                "[a] add repo path",
-                "[f] browse folders",
-                "[d] remove selected repo",
-                "[r] refresh registry",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::RepoBrowser => &[
-                "[j]/[k] move selection",
-                "[Enter] open directory / add git repo",
-                "[Backspace] go parent directory",
-                "[.] toggle hidden dotfiles",
-                "[b] back to main menu",
-                "[r] refresh browser",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::BranchPicker => &[
-                "[j]/[k] move selection",
-                "[Enter] switch branch",
-                "[n] create and switch branch",
-                "[1]-[6] switch workspace tab",
-                "[b] back to repo view",
-                "[r] refresh branches",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::RemoteBranchPicker => &[
-                "[j]/[k] move selection",
-                "[Enter] checkout remote tracking branch",
-                "[g] switch to local branch list",
-                "[1]-[6] switch workspace tab",
-                "[b] back to repo view",
-                "[r] refresh remote branches",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::HistoryView => &[
-                "[j]/[k] move selection",
-                "[Enter] load commit details",
-                "[o] checkout selected commit (detached)",
-                "[p] cherry-pick selected commit",
-                "[1]-[6] switch workspace tab",
-                "[b] back to repo view",
-                "[r] refresh history",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::PullRequestView => &[
-                "[j]/[k] move selection",
-                "[Enter]/[o] open PR in browser",
-                "[c] checkout PR branch",
-                "[m]/[s]/[R] merge/squash/rebase PR",
-                "[n] create PR",
-                "[f] cycle filter",
-                "[1]-[6] switch workspace tab",
-                "[b] back to repo view",
-                "[r] refresh PR list",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::TrackingStatusView => &[
-                "[1]-[6] switch workspace tab",
-                "[b] back to repo view",
-                "[r] refresh compare view",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::StashView => &[
-                "[j]/[k] move selection",
-                "[Enter] load stash details",
-                "[s] stash current changes",
-                "[a] apply selected stash",
-                "[p] pop selected stash",
-                "[d] drop selected stash (confirm)",
-                "[1]-[6] switch workspace tab",
-                "[b] back to repo view",
-                "[r] refresh stashes",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
-            Screen::RepoView => &[
-                "[Tab] switch unstaged/staged pane",
-                "[j]/[k] move selection",
-                "[s]/[S] stage selected/all unstaged",
-                "[u]/[U] unstage selected/all staged",
-                "[x] discard selected unstaged (confirm)",
-                "[c] commit staged changes",
-                "[g] local branches, [G] remote branches",
-                "[h] history, [i] incoming/outgoing compare, [t] stash",
-                "[P] pull requests",
-                "[1]-[6] switch workspace tab",
-                "[f]/[l]/[p] fetch/pull/push",
-                "[v]/[z] cherry-pick continue/abort",
-                "[b] back to main menu",
-                "[r] refresh status",
-                "[L] show log path",
-                "[q] quit",
-                "[?] close help",
-            ],
+        let mut lines = Vec::new();
+        let mut section = |title: &str, items: &[String]| {
+            lines.push(title.to_string());
+            lines.extend(items.iter().cloned());
+            lines.push(String::new());
         };
-        lines.iter().map(|line| (*line).to_string()).collect()
+
+        section(
+            "Global",
+            &[
+                "[?] close help".to_string(),
+                "[q] quit".to_string(),
+                "[r] refresh current view".to_string(),
+                "[L] show log path".to_string(),
+            ],
+        );
+
+        let nav_items = vec!["[j]/[k] move selection".to_string()];
+        let workspace_tabs = vec!["[1]-[6] switch workspace tab".to_string()];
+
+        match self.screen {
+            Screen::RepoPicker => {
+                section(
+                    "Main Menu",
+                    &[
+                        nav_items[0].clone(),
+                        "[Enter] open selected repository".to_string(),
+                        "[a] add repository path".to_string(),
+                        "[f] open repo browser".to_string(),
+                        "[d] remove selected repository".to_string(),
+                    ],
+                );
+            }
+            Screen::RepoBrowser => {
+                section(
+                    "Repo Browser",
+                    &[
+                        nav_items[0].clone(),
+                        "[Enter] open directory / add git repo".to_string(),
+                        "[Backspace] go parent directory".to_string(),
+                        "[.] toggle hidden dotfiles".to_string(),
+                        "[b] back to main menu".to_string(),
+                    ],
+                );
+            }
+            Screen::BranchPicker => {
+                section(
+                    "Branches",
+                    &[
+                        nav_items[0].clone(),
+                        "[Enter] switch selected branch".to_string(),
+                        "[n] create and switch branch".to_string(),
+                        "[G] open remote branches".to_string(),
+                        "[b] back to status tab".to_string(),
+                    ],
+                );
+                section("Workspace", &workspace_tabs);
+            }
+            Screen::RemoteBranchPicker => {
+                section(
+                    "Remote Branches",
+                    &[
+                        nav_items[0].clone(),
+                        "[Enter] checkout tracking/local branch".to_string(),
+                        "[g] open local branches".to_string(),
+                        "[b] back to status tab".to_string(),
+                    ],
+                );
+                section("Workspace", &workspace_tabs);
+            }
+            Screen::HistoryView => {
+                section(
+                    "History",
+                    &[
+                        nav_items[0].clone(),
+                        "[Enter] load commit details".to_string(),
+                        "[o] checkout selected commit (detached)".to_string(),
+                        "[p] cherry-pick selected commit".to_string(),
+                        "[b] back to status tab".to_string(),
+                    ],
+                );
+                section("Workspace", &workspace_tabs);
+            }
+            Screen::PullRequestView => {
+                section(
+                    "Pull Requests",
+                    &[
+                        nav_items[0].clone(),
+                        "[Enter]/[o] open PR in browser".to_string(),
+                        "[c] checkout PR branch".to_string(),
+                        "[m]/[s]/[R] merge/squash/rebase PR".to_string(),
+                        "[n] create PR".to_string(),
+                        "[f] cycle PR filter".to_string(),
+                        "[b] back to status tab".to_string(),
+                    ],
+                );
+                section("Workspace", &workspace_tabs);
+            }
+            Screen::TrackingStatusView => {
+                section(
+                    "Incoming/Outgoing",
+                    &[
+                        "[f]/[l]/[p] fetch/pull/push".to_string(),
+                        "[b] back to status tab".to_string(),
+                    ],
+                );
+                section("Workspace", &workspace_tabs);
+            }
+            Screen::StashView => {
+                section(
+                    "Stash",
+                    &[
+                        nav_items[0].clone(),
+                        "[Enter] load stash details".to_string(),
+                        "[s] stash current changes".to_string(),
+                        "[a] apply selected stash".to_string(),
+                        "[p] pop selected stash".to_string(),
+                        "[d] drop selected stash (confirm)".to_string(),
+                        "[b] back to status tab".to_string(),
+                    ],
+                );
+                section("Workspace", &workspace_tabs);
+            }
+            Screen::RepoView => {
+                let focus = match self.focus {
+                    FocusPane::Unstaged => "unstaged",
+                    FocusPane::Staged => "staged",
+                };
+                section(
+                    "Status Tab",
+                    &[
+                        format!("[Tab] switch pane (current: {focus})"),
+                        nav_items[0].clone(),
+                        "[b] back to main menu".to_string(),
+                    ],
+                );
+                section(
+                    "Pane Actions",
+                    &[
+                        "[s]/[S] stage selected/all unstaged".to_string(),
+                        "[u]/[U] unstage selected/all staged".to_string(),
+                        "[x] discard selected unstaged (confirm)".to_string(),
+                        "[c] commit staged changes".to_string(),
+                    ],
+                );
+                section(
+                    "Repo Actions",
+                    &[
+                        "[f]/[l]/[p] fetch/pull/push".to_string(),
+                        "[v]/[z] cherry-pick continue/abort".to_string(),
+                    ],
+                );
+                section(
+                    "Open Tabs",
+                    &[
+                        "[g]/[G] local/remote branches".to_string(),
+                        "[h] history".to_string(),
+                        "[i] incoming/outgoing".to_string(),
+                        "[t] stash".to_string(),
+                        "[P] pull requests".to_string(),
+                    ],
+                );
+                section("Workspace", &workspace_tabs);
+            }
+        }
+
+        if lines.last().is_some_and(|line| line.is_empty()) {
+            lines.pop();
+        }
+        lines
     }
 
     pub fn set_runtime_log_path(&mut self, path: PathBuf) {
@@ -515,6 +589,8 @@ impl App {
                 self.snapshot = git::snapshot(root)?;
                 self.refresh_last_fetch_from_git_metadata();
                 self.ensure_selection_bounds();
+                self.invalidate_repo_preview_cache();
+                self.schedule_repo_preview_refresh();
                 self.status_message = "Refreshed git status".to_string();
             }
         }
@@ -529,6 +605,8 @@ impl App {
             FocusPane::Unstaged => FocusPane::Staged,
             FocusPane::Staged => FocusPane::Unstaged,
         };
+        self.invalidate_repo_preview_cache();
+        self.schedule_repo_preview_refresh();
     }
 
     pub fn move_next(&mut self) {
@@ -565,7 +643,7 @@ impl App {
             Screen::PullRequestView => {
                 if !self.pull_requests.is_empty() {
                     self.selected_pr = min(self.selected_pr + 1, self.pull_requests.len() - 1);
-                    self.refresh_selected_pr_status_summary();
+                    self.schedule_selected_pr_status_refresh();
                 }
             }
             Screen::TrackingStatusView => {}
@@ -580,11 +658,15 @@ impl App {
                     if !self.snapshot.unstaged.is_empty() {
                         self.selected_unstaged =
                             min(self.selected_unstaged + 1, self.snapshot.unstaged.len() - 1);
+                        self.invalidate_repo_preview_cache();
+                        self.schedule_repo_preview_refresh();
                     }
                 }
                 FocusPane::Staged => {
                     if !self.snapshot.staged.is_empty() {
                         self.selected_staged = min(self.selected_staged + 1, self.snapshot.staged.len() - 1);
+                        self.invalidate_repo_preview_cache();
+                        self.schedule_repo_preview_refresh();
                     }
                 }
             },
@@ -611,7 +693,7 @@ impl App {
             }
             Screen::PullRequestView => {
                 self.selected_pr = self.selected_pr.saturating_sub(1);
-                self.refresh_selected_pr_status_summary();
+                self.schedule_selected_pr_status_refresh();
             }
             Screen::TrackingStatusView => {}
             Screen::StashView => {
@@ -619,8 +701,16 @@ impl App {
                 self.clear_stash_details();
             }
             Screen::RepoView => match self.focus {
-                FocusPane::Unstaged => self.selected_unstaged = self.selected_unstaged.saturating_sub(1),
-                FocusPane::Staged => self.selected_staged = self.selected_staged.saturating_sub(1),
+                FocusPane::Unstaged => {
+                    self.selected_unstaged = self.selected_unstaged.saturating_sub(1);
+                    self.invalidate_repo_preview_cache();
+                    self.schedule_repo_preview_refresh();
+                }
+                FocusPane::Staged => {
+                    self.selected_staged = self.selected_staged.saturating_sub(1);
+                    self.invalidate_repo_preview_cache();
+                    self.schedule_repo_preview_refresh();
+                }
             },
         }
     }
@@ -694,10 +784,11 @@ impl App {
             self.status_message = "Stage files before committing".to_string();
             return;
         }
-        self.input_mode = InputMode::CommitMessage;
+        self.pending_commit_subject = None;
+        self.input_mode = InputMode::CommitSubject;
         self.input_buffer.clear();
         self.input_cursor = 0;
-        self.status_message = "Enter commit message and press [Enter]".to_string();
+        self.status_message = "Enter commit subject and press [Enter]".to_string();
     }
 
     pub fn return_to_repo_view(&mut self) {
@@ -712,6 +803,8 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
+        self.pending_commit_subject = None;
+        self.schedule_repo_preview_refresh();
         self.status_message = "Repository view".to_string();
     }
 
@@ -727,6 +820,7 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
+        self.pending_commit_subject = None;
         self.status_message = if was_stash_drop_confirmation {
             "Stash drop cancelled".to_string()
         } else if was_discard_confirmation {
@@ -798,7 +892,8 @@ impl App {
     pub fn submit_input(&mut self) -> Result<()> {
         match self.input_mode {
             InputMode::None => Ok(()),
-            InputMode::CommitMessage => self.commit_from_input(),
+            InputMode::CommitSubject => self.commit_subject_from_input(),
+            InputMode::CommitBody => self.commit_body_from_input(),
             InputMode::AddRepoPath => self.add_repo_from_input(),
             InputMode::NewBranchName => self.create_branch_from_input(),
             InputMode::CreatePullRequestTitle => self.create_pull_request_title_from_input(),
@@ -869,7 +964,7 @@ impl App {
     }
 
     pub fn fetch_remotes(&mut self) -> Result<()> {
-        if self.screen != Screen::RepoView {
+        if !matches!(self.screen, Screen::RepoView | Screen::TrackingStatusView) {
             self.status_message = "Open a repository before fetching".to_string();
             return Ok(());
         }
@@ -877,32 +972,41 @@ impl App {
         git::fetch(&root)?;
         self.snapshot = git::snapshot(&root)?;
         self.refresh_last_fetch_from_git_metadata();
+        if self.screen == Screen::TrackingStatusView {
+            let _ = self.refresh_tracking_status_summary();
+        }
         self.ensure_selection_bounds();
         self.status_message = "Fetched remotes".to_string();
         Ok(())
     }
 
     pub fn pull_current_branch(&mut self) -> Result<()> {
-        if self.screen != Screen::RepoView {
+        if !matches!(self.screen, Screen::RepoView | Screen::TrackingStatusView) {
             self.status_message = "Open a repository before pulling".to_string();
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
         git::pull(&root)?;
         self.snapshot = git::snapshot(&root)?;
+        if self.screen == Screen::TrackingStatusView {
+            let _ = self.refresh_tracking_status_summary();
+        }
         self.ensure_selection_bounds();
         self.status_message = "Pulled latest changes".to_string();
         Ok(())
     }
 
     pub fn push_current_branch(&mut self) -> Result<()> {
-        if self.screen != Screen::RepoView {
+        if !matches!(self.screen, Screen::RepoView | Screen::TrackingStatusView) {
             self.status_message = "Open a repository before pushing".to_string();
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
         git::push(&root)?;
         self.snapshot = git::snapshot(&root)?;
+        if self.screen == Screen::TrackingStatusView {
+            let _ = self.refresh_tracking_status_summary();
+        }
         self.ensure_selection_bounds();
         self.status_message = "Pushed current branch".to_string();
         Ok(())
@@ -1021,8 +1125,12 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
+        self.pending_commit_subject = None;
         self.clear_history_details();
         self.clear_pr_status_summary();
+        self.invalidate_repo_preview_cache();
+        self.repo_preview_refresh_deadline = None;
+        self.repo_preview_text = "No unstaged diff output for selected file.".to_string();
         self.status_message = "Main menu".to_string();
     }
 
@@ -1100,29 +1208,12 @@ impl App {
             Screen::PullRequestView => self.pull_request_preview_text(),
             Screen::TrackingStatusView => self.tracking_status_preview_text(),
             Screen::StashView => self.stash_preview_text(),
-            Screen::RepoView => match self.focus {
-                FocusPane::Unstaged => self
-                    .current_unstaged()
-                    .and_then(|file| {
-                        self.current_repo_root()
-                            .ok()
-                            .and_then(|root| git::diff_for_file(root, &file.path, false).ok())
-                    })
-                    .map_or_else(|| "No unstaged diff output for selected file.".to_string(), |d| truncate_lines(d, 120)),
-                FocusPane::Staged => self
-                    .current_staged()
-                    .and_then(|file| {
-                        self.current_repo_root()
-                            .ok()
-                            .and_then(|root| git::diff_for_file(root, &file.path, true).ok())
-                    })
-                    .map_or_else(|| "No staged diff output for selected file.".to_string(), |d| truncate_lines(d, 120)),
-            },
+            Screen::RepoView => self.repo_preview_text.clone(),
         }
     }
 
     pub fn branch_summary(&self) -> String {
-        if self.screen != Screen::RepoView {
+        if !self.has_open_repo() {
             return "No repository opened".to_string();
         }
         let mut summary = self.snapshot.branch.clone();
@@ -1159,7 +1250,10 @@ impl App {
 
     pub fn popup_title(&self) -> &'static str {
         match self.input_mode {
-            InputMode::CommitMessage => "Commit message ([Enter] submit, [Esc] cancel)",
+            InputMode::CommitSubject => "Commit subject ([Enter] next, [Esc] cancel)",
+            InputMode::CommitBody => {
+                "Commit body ([Enter] newline, [Ctrl+Enter]/[F2] submit, [Esc] cancel)"
+            }
             InputMode::AddRepoPath => "Add repository path ([Enter] submit, [Esc] cancel)",
             InputMode::NewBranchName => "New branch name ([Enter] create/switch, [Esc] cancel)",
             InputMode::CreatePullRequestTitle => "Create PR: title ([Enter] next, [Esc] cancel)",
@@ -1173,7 +1267,8 @@ impl App {
 
     pub fn popup_input_text(&self) -> Option<&str> {
         match self.input_mode {
-            InputMode::CommitMessage
+            InputMode::CommitSubject
+            | InputMode::CommitBody
             | InputMode::AddRepoPath
             | InputMode::NewBranchName
             | InputMode::CreatePullRequestTitle
@@ -1184,11 +1279,18 @@ impl App {
 
     pub fn popup_input_prefix(&self) -> Option<String> {
         match self.input_mode {
+            InputMode::CommitBody => {
+                let subject = self
+                    .pending_commit_subject
+                    .as_deref()
+                    .unwrap_or("(missing subject)");
+                Some(format!("Subject: {subject}\n\n"))
+            }
             InputMode::CreatePullRequestBody => {
                 let title = self.pending_pr_title.as_deref().unwrap_or("(missing title)");
                 Some(format!("Title: {title}\n\n"))
             }
-            InputMode::CommitMessage
+            InputMode::CommitSubject
             | InputMode::AddRepoPath
             | InputMode::NewBranchName
             | InputMode::CreatePullRequestTitle => Some(String::new()),
@@ -1236,6 +1338,13 @@ impl App {
                     pending.title
                 )
             }
+            InputMode::CommitBody => {
+                if let Some(subject) = &self.pending_commit_subject {
+                    format!("Subject: {}\n\n{}", subject, self.input_buffer)
+                } else {
+                    self.input_buffer.clone()
+                }
+            }
             InputMode::CreatePullRequestBody => {
                 if let Some(title) = &self.pending_pr_title {
                     format!("Title: {}\n\n{}", title, self.input_buffer)
@@ -1243,7 +1352,7 @@ impl App {
                     self.input_buffer.clone()
                 }
             }
-            InputMode::CommitMessage
+            InputMode::CommitSubject
             | InputMode::AddRepoPath
             | InputMode::NewBranchName
             | InputMode::CreatePullRequestTitle => self.input_buffer.clone(),
@@ -1251,14 +1360,41 @@ impl App {
         }
     }
 
-    fn commit_from_input(&mut self) -> Result<()> {
-        let message = self.input_buffer.trim();
-        if message.is_empty() {
-            self.status_message = "Commit message cannot be empty".to_string();
+    pub fn input_mode_allows_multiline(&self) -> bool {
+        matches!(self.input_mode, InputMode::CommitBody)
+    }
+
+    fn commit_subject_from_input(&mut self) -> Result<()> {
+        let subject = self.input_buffer.trim();
+        if subject.is_empty() {
+            self.status_message = "Commit subject cannot be empty".to_string();
             return Ok(());
         }
+        self.pending_commit_subject = Some(subject.to_string());
+        self.input_mode = InputMode::CommitBody;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.status_message = "Enter commit body (optional), [Ctrl+Enter] or [F2] to commit".to_string();
+        Ok(())
+    }
+
+    fn commit_body_from_input(&mut self) -> Result<()> {
+        let Some(subject) = self.pending_commit_subject.take() else {
+            self.input_mode = InputMode::None;
+            self.input_buffer.clear();
+            self.input_cursor = 0;
+            self.status_message = "Commit subject is missing; start commit again".to_string();
+            return Ok(());
+        };
+
+        let body = self.input_buffer.trim_end().to_string();
+        let body_option = if body.trim().is_empty() {
+            None
+        } else {
+            Some(body.as_str())
+        };
         let root = self.current_repo_root()?.to_path_buf();
-        git::commit(&root, message)?;
+        git::commit(&root, &subject, body_option)?;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
         self.input_cursor = 0;
@@ -1438,7 +1574,10 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
+        self.pending_commit_subject = None;
         self.clear_pr_status_summary();
+        self.invalidate_repo_preview_cache();
+        self.schedule_repo_preview_refresh();
         self.status_message = "Opened repository".to_string();
         Ok(())
     }
@@ -1484,7 +1623,7 @@ impl App {
         self.clear_pr_status_summary();
         self.pull_requests = git::pull_requests(&root, self.pr_filter)?;
         self.selected_pr = min(self.selected_pr, self.pull_requests.len().saturating_sub(1));
-        self.refresh_selected_pr_status_summary();
+        self.schedule_selected_pr_status_refresh();
         Ok(())
     }
 
@@ -1547,6 +1686,8 @@ impl App {
         } else {
             self.selected_staged = min(self.selected_staged, self.snapshot.staged.len() - 1);
         }
+        self.invalidate_repo_preview_cache();
+        self.schedule_repo_preview_refresh();
     }
 
     fn pull_request_preview_text(&self) -> String {
@@ -1599,11 +1740,149 @@ impl App {
                 self.pr_status_summary = None;
             }
         }
+        self.pr_status_pending_for = None;
+        self.pr_status_refresh_deadline = None;
     }
 
     fn clear_pr_status_summary(&mut self) {
         self.pr_status_for = None;
         self.pr_status_summary = None;
+        self.pr_status_pending_for = None;
+        self.pr_status_refresh_deadline = None;
+    }
+
+    fn schedule_selected_pr_status_refresh(&mut self) {
+        let Some(pr) = self.pull_requests.get(self.selected_pr) else {
+            self.clear_pr_status_summary();
+            return;
+        };
+        self.pr_status_pending_for = Some(pr.number);
+        self.pr_status_refresh_deadline = Some(Instant::now() + Duration::from_millis(220));
+    }
+
+    fn maybe_refresh_pr_status_summary(&mut self) {
+        if self.screen != Screen::PullRequestView || self.in_input_mode() || self.help_visible {
+            return;
+        }
+        let Some(deadline) = self.pr_status_refresh_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        let Some(expected_pr) = self.pr_status_pending_for else {
+            self.pr_status_refresh_deadline = None;
+            return;
+        };
+        let current_pr = self.pull_requests.get(self.selected_pr).map(|pr| pr.number);
+        if current_pr != Some(expected_pr) {
+            self.schedule_selected_pr_status_refresh();
+            return;
+        }
+        self.refresh_selected_pr_status_summary();
+    }
+
+    fn schedule_repo_preview_refresh(&mut self) {
+        if self.screen != Screen::RepoView {
+            self.repo_preview_refresh_deadline = None;
+            return;
+        }
+        let key = self.current_repo_preview_key();
+        if self.repo_preview_key == key {
+            self.repo_preview_refresh_deadline = None;
+            return;
+        }
+
+        if key.is_none() {
+            self.repo_preview_text = self.empty_repo_preview_text();
+            self.repo_preview_refresh_deadline = None;
+            return;
+        }
+
+        self.repo_preview_text = "Loading preview...".to_string();
+        self.repo_preview_refresh_deadline = Some(Instant::now() + Duration::from_millis(110));
+    }
+
+    fn maybe_refresh_repo_preview_cache(&mut self) {
+        if self.screen != Screen::RepoView || self.in_input_mode() || self.help_visible {
+            return;
+        }
+        let Some(deadline) = self.repo_preview_refresh_deadline else {
+            return;
+        };
+        if Instant::now() < deadline {
+            return;
+        }
+        self.repo_preview_refresh_deadline = None;
+        self.refresh_repo_preview_cache();
+    }
+
+    fn refresh_repo_preview_cache(&mut self) {
+        if self.screen != Screen::RepoView {
+            return;
+        }
+        let key = self.current_repo_preview_key();
+
+        if self.repo_preview_key == key {
+            return;
+        }
+
+        if key.is_none() {
+            self.repo_preview_text = self.empty_repo_preview_text();
+            self.repo_preview_key = None;
+            return;
+        }
+
+        let preview = match self.focus {
+            FocusPane::Unstaged => self
+                .current_unstaged()
+                .and_then(|file| {
+                    self.current_repo_root()
+                        .ok()
+                        .and_then(|root| git::diff_for_file(root, &file.path, false).ok())
+                })
+                .map_or_else(
+                    || "No unstaged diff output for selected file.".to_string(),
+                    |d| truncate_lines(d, 90),
+                ),
+            FocusPane::Staged => self
+                .current_staged()
+                .and_then(|file| {
+                    self.current_repo_root()
+                        .ok()
+                        .and_then(|root| git::diff_for_file(root, &file.path, true).ok())
+                })
+                .map_or_else(
+                    || "No staged diff output for selected file.".to_string(),
+                    |d| truncate_lines(d, 90),
+                ),
+        };
+
+        self.repo_preview_key = key;
+        self.repo_preview_text = preview;
+    }
+
+    fn invalidate_repo_preview_cache(&mut self) {
+        self.repo_preview_key = None;
+    }
+
+    fn current_repo_preview_key(&self) -> Option<String> {
+        match self.focus {
+            FocusPane::Unstaged => self.current_unstaged().map(|entry| format!(
+                "unstaged:{}:{}",
+                self.selected_unstaged, entry.path
+            )),
+            FocusPane::Staged => self
+                .current_staged()
+                .map(|entry| format!("staged:{}:{}", self.selected_staged, entry.path)),
+        }
+    }
+
+    fn empty_repo_preview_text(&self) -> String {
+        match self.focus {
+            FocusPane::Unstaged => "No unstaged diff output for selected file.".to_string(),
+            FocusPane::Staged => "No staged diff output for selected file.".to_string(),
+        }
     }
 
     fn tracking_status_preview_text(&self) -> String {
@@ -1636,7 +1915,7 @@ impl App {
         };
 
         format!(
-            "Upstream: {}\n\nOutgoing ({}):\n{}\n\nIncoming ({}):\n{}",
+            "Upstream: {}\n\nOutgoing ({}):\n{}\n\nIncoming ({}):\n{}\n\n[f] fetch  [l] pull  [p] push",
             summary.upstream,
             summary.outgoing.len(),
             outgoing,

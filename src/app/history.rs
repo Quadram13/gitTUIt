@@ -82,7 +82,7 @@ impl App {
 
     pub(crate) fn refresh_history_entries(&mut self) -> Result<()> {
         let root = self.current_repo_root()?.to_path_buf();
-        self.history_entries = git::commit_history(&root, 80)?;
+        self.history_entries = git::commit_history(&root, 50)?;
         self.selected_history = std::cmp::min(
             self.selected_history,
             self.history_entries.len().saturating_sub(1),

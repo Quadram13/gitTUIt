@@ -5,12 +5,14 @@ gitTUIt is a terminal UI for Git/Github workflows.
 ## Current Features
 
 - explicit repo tracking(requires local storage)
-- stage/unstage/commit changes 
+- stage/unstage/commit changes (subject + optional multiline body)
 - diff preview for selected file
 - history view with commit details, checkout (detached), and cherry-pick
 - incoming/outgoing commit comparison against upstream tracking branch
 - stash manager (stash/apply/pop/drop with preview)
 - GitHub pull request view (list/filter/open/checkout via Github CLI)
+- responsiveness optimizations and context-grouped commands
+    - these changes were influenced by how gitUI handles UI/UX(which I am admittedly not great at)
 
 ## Motivation/Inspiration
 
@@ -18,9 +20,7 @@ I use Arch Linux on my daily driver(insert tired joke here), and much of my desk
 
 My current job uses the [conventional commit specification](https://www.conventionalcommits.org/en/v1.0.0/#specification), as well as [release-please](https://github.com/googleapis/release-please) for releases, changelogs, and other version control automation. Repo-specific scripts used alongside the [cargo-make crate](https://crates.io/crates/cargo-make/0.3.54) handle these workflows locally, but I felt that I could make this sort of automation (relatively) repo-agnostic. 
 
-Existing TUIs like [gitui](https://github.com/gitui-org/gitui) contain most, if not all of the features in this project(and probably implement them way better). One might also say that individual git commands in a terminal "gives" retro computing, but everyone draws the line between "vibes" and convenience somewhere. 
-
-Ultimately, I decided to build this TUI from the ground up, not just as a tool for my job, but also as a personal project and something that others can potentially use in the future.
+Existing TUIs like [gitUI](https://github.com/gitui-org/gitui) contain most, if not all of the features in this project(and probably implement them way better). One might also say that individual git commands in a terminal "gives" retro computing, but everyone draws the line between "vibes" and convenience somewhere. Ultimately, I decided to build this TUI from the ground up, not just as a tool for my job, but also as a personal project and something that others can potentially use in the future.
 
 ## Roadmap
 
@@ -42,10 +42,16 @@ These are changes/things I note that may not slot cleanly into the list:
 - not sure if this app/repo contains/interacts with any sensitive info
     * should probably do a check for any security concerns
 
-- most established TUIs use async features/IO
-    * this TUI currently does not have any async stuff implemented, but works fine for now
-
-    * should probably add this at some point
+- async architecture (remaining work):
+    * move git/gh commands off the UI thread with background workers/tasks
+    * add job lifecycle states (queued/running/success/error) and safe result handoff to UI
+    * support cancel/debounce for long-running or high-frequency jobs (diff/pr/status/history)
+    * make directory scanning and heavy file IO non-blocking
+    * add loading/progress indicators tied to background tasks (beyond current UI-thread placeholders)
+    - current non-async responsiveness constraints:
+        * status diff preview refresh is debounced and lazily loaded after short idle instead of per-keypress execution
+        * status diff preview shows a temporary loading placeholder while deferred refresh is pending
+        * default preview/history windows are intentionally smaller (diff preview truncation and history list size) for faster interaction
 
 - repo setup for contribution
     * proper license(probably MIT?)

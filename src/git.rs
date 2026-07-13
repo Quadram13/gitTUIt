@@ -86,8 +86,14 @@ pub fn discard_file(repo_root: &Path, path: &str, is_untracked: bool) -> Result<
     run_command("git", ["checkout", "--", path], repo_root).map(|_| ())
 }
 
-pub fn commit(repo_root: &Path, message: &str) -> Result<()> {
-    run_command("git", ["commit", "-m", message], repo_root).map(|_| ())
+pub fn commit(repo_root: &Path, subject: &str, body: Option<&str>) -> Result<()> {
+    let mut args = vec!["commit", "-m", subject];
+    if let Some(body_text) = body {
+        if !body_text.trim().is_empty() {
+            args.extend(["-m", body_text]);
+        }
+    }
+    run_command("git", args, repo_root).map(|_| ())
 }
 
 pub fn fetch(repo_root: &Path) -> Result<()> {

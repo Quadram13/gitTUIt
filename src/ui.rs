@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, FocusPane, Screen};
+use crate::app::{App, FocusPane, InputMode, Screen};
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let root = frame.area();
@@ -32,75 +32,29 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
-    let primary_line = match app.screen {
-        Screen::RepoPicker => Line::from(vec![
-            "Mode: ".into(),
-            "Main Menu".yellow(),
-            " | Tracked Repos: ".into(),
-            app.registry.repos.len().to_string().green(),
-        ]),
-        Screen::RepoBrowser => Line::from(vec![
-            "Mode: ".into(),
-            "Repo Browser".yellow(),
-            " | Directory: ".into(),
-            app.active_repo_label().green(),
-        ]),
-        Screen::BranchPicker => Line::from(vec![
-            "Mode: ".into(),
-            "Branch Picker".yellow(),
-            " | Repo: ".into(),
-            app.active_repo_label().green(),
-            " | ".into(),
-            app.last_fetch_summary().green(),
-        ]),
-        Screen::RemoteBranchPicker => Line::from(vec![
-            "Mode: ".into(),
-            "Remote Branches".yellow(),
-            " | Repo: ".into(),
-            app.active_repo_label().green(),
-            " | ".into(),
-            app.last_fetch_summary().green(),
-        ]),
-        Screen::HistoryView => Line::from(vec![
-            "Mode: ".into(),
-            "History".yellow(),
-            " | Repo: ".into(),
-            app.active_repo_label().green(),
-            " | ".into(),
-            app.last_fetch_summary().green(),
-        ]),
-        Screen::PullRequestView => Line::from(vec![
-            "Mode: ".into(),
-            "Pull Requests".yellow(),
-            " | Filter: ".into(),
-            app.pull_request_filter_label().green(),
-            " | ".into(),
-            app.last_fetch_summary().green(),
-        ]),
-        Screen::TrackingStatusView => Line::from(vec![
-            "Mode: ".into(),
-            "Incoming/Outgoing".yellow(),
-            " | Repo: ".into(),
-            app.active_repo_label().green(),
-            " | ".into(),
-            app.last_fetch_summary().green(),
-        ]),
-        Screen::StashView => Line::from(vec![
-            "Mode: ".into(),
-            "Stash".yellow(),
-            " | Repo: ".into(),
-            app.active_repo_label().green(),
-            " | ".into(),
-            app.last_fetch_summary().green(),
-        ]),
-        Screen::RepoView => Line::from(vec![
+    let primary_line = if app.is_repo_workspace_screen() {
+        Line::from(vec![
             "Repo: ".into(),
             app.active_repo_label().yellow(),
             " | Branch: ".into(),
             app.branch_summary().green(),
             " | ".into(),
             app.last_fetch_summary().green(),
-        ]),
+        ])
+    } else {
+        match app.screen {
+            Screen::RepoPicker => Line::from(vec![
+                "Main Menu".yellow(),
+                " | Tracked Repos: ".into(),
+                app.registry.repos.len().to_string().green(),
+            ]),
+            Screen::RepoBrowser => Line::from(vec![
+                "Repo Browser".yellow(),
+                " | Directory: ".into(),
+                app.active_repo_label().green(),
+            ]),
+            _ => Line::from("gitTUIt"),
+        }
     };
     let mut lines = vec![primary_line];
     if app.is_repo_workspace_screen() {
@@ -169,25 +123,11 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
-        ])
-        .split(area);
-
-    draw_unstaged(frame, app, columns[0]);
-    draw_staged(frame, app, columns[1]);
-    draw_preview(frame, app, columns[2]);
+    draw_repo_status_view(frame, app, area);
 }
 
 fn draw_repo_picker(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
+    let columns = split_master_detail(area, 55, 45);
 
     let items = if app.registry.repos.is_empty() {
         vec![ListItem::new("No repositories tracked")]
@@ -210,7 +150,7 @@ fn draw_repo_picker(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Main Menu ([Enter] open, [a] add path, [f] browse folders, [d] remove)"),
+                .title("Main Menu"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -228,10 +168,7 @@ fn draw_repo_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_repo_browser(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
+    let columns = split_master_detail(area, 55, 45);
 
     let items = if app.browser_entries.is_empty() {
         vec![ListItem::new("(empty directory)")]
@@ -255,7 +192,7 @@ fn draw_repo_browser(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Browser ([Enter] open/add, [Backspace] up, [.] hidden, [b] back)"),
+                .title("Repo Browser"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -273,10 +210,7 @@ fn draw_repo_browser(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
+    let columns = split_master_detail(area, 55, 45);
 
     let items = if app.branch_entries.is_empty() {
         vec![ListItem::new("No local branches")]
@@ -298,7 +232,7 @@ fn draw_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Branches ([Enter] switch, [n] new branch, [b] back)"),
+                .title("Branches"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -316,10 +250,7 @@ fn draw_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_history_view(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
+    let columns = split_master_detail(area, 55, 45);
 
     let items = if app.history_entries.is_empty() {
         vec![ListItem::new("No commits found")]
@@ -339,7 +270,7 @@ fn draw_history_view(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("History ([Enter] details, [o] checkout, [p] cherry-pick, [b] back)"),
+                .title("History"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -357,10 +288,7 @@ fn draw_history_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_remote_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
+    let columns = split_master_detail(area, 55, 45);
 
     let items = if app.remote_branch_entries.is_empty() {
         vec![ListItem::new("No remote branches found")]
@@ -375,7 +303,7 @@ fn draw_remote_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Remote Branches ([Enter] checkout tracking branch, [b] back)"),
+                .title("Remote Branches"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -393,10 +321,7 @@ fn draw_remote_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_pull_request_view(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
+    let columns = split_master_detail(area, 55, 45);
 
     let items = if app.pull_requests.is_empty() {
         vec![ListItem::new("No pull requests for current filter")]
@@ -414,7 +339,7 @@ fn draw_pull_request_view(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Pull Requests ([Enter/o] open, [c] checkout, [m]/[s]/[R] merge, [n] create, [f] filter, [b] back)"),
+                .title("Pull Requests"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -443,10 +368,7 @@ fn draw_tracking_status_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_stash_view(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(area);
+    let columns = split_master_detail(area, 45, 55);
 
     let items = if app.stash_entries.is_empty() {
         vec![ListItem::new("No stash entries")]
@@ -461,7 +383,7 @@ fn draw_stash_view(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Stash ([s] stash now, [a] apply, [p] pop, [d] drop, [b] back)"),
+                .title("Stash"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -497,7 +419,7 @@ fn draw_unstaged(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Unstaged ([s] stage, [S] stage all, [x] discard selected)")
+                .title("Unstaged ([s/S] stage/all, [x] discard)")
                 .border_style(border_style),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
@@ -529,7 +451,7 @@ fn draw_staged(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Staged ([u] unstage, [U] unstage all, [c] commit)")
+                .title("Staged ([u/U] unstage/all, [c] commit)")
                 .border_style(border_style),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
@@ -549,189 +471,93 @@ fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(preview, area);
 }
 
-fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let lines = match app.screen {
-        Screen::RepoPicker => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[j/k] move",
-                    "[Enter] open",
-                    "[a] add",
-                    "[f] browse",
-                    "[d] remove",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::RepoBrowser => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[j/k] move",
-                    "[Enter] open/add",
-                    "[Backspace] parent",
-                    "[.] hidden",
-                    "[b] back",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::BranchPicker => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[j/k] move",
-                    "[Enter] switch",
-                    "[n] new",
-                    "[1-6] tabs",
-                    "[b] back",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::RemoteBranchPicker => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[j/k] move",
-                    "[Enter] checkout",
-                    "[g] local",
-                    "[1-6] tabs",
-                    "[b] back",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::HistoryView => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[j/k] move",
-                    "[Enter] details",
-                    "[o] checkout",
-                    "[p] cherry-pick",
-                    "[1-6] tabs",
-                    "[b] back",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::PullRequestView => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[j/k] move",
-                    "[Enter/o] open",
-                    "[c] checkout",
-                    "[m/s/R] merge",
-                    "[n] create",
-                    "[f] filter",
-                    "[1-6] tabs",
-                    "[b] back",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::TrackingStatusView => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[1-6] tabs",
-                    "[b] back",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::StashView => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[j/k] move",
-                    "[Enter] details",
-                    "[s] stash",
-                    "[a] apply",
-                    "[p] pop",
-                    "[d] drop",
-                    "[1-6] tabs",
-                    "[b] back",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-        Screen::RepoView => vec![
-            Line::from(app.status_message.clone()),
-            Line::from(compose_compact_footer(
-                area.width,
-                &[
-                    "[Tab] pane",
-                    "[j/k] move",
-                    "[s/S] stage",
-                    "[u/U] unstage",
-                    "[c] commit",
-                    "[g/G] branches",
-                    "[h] history",
-                    "[i] in/out",
-                    "[t] stash",
-                    "[P] PRs",
-                    "[f/l/p] sync",
-                    "[1-6] tabs",
-                    "[b] repos",
-                    "[r] refresh",
-                    "[L] log",
-                    "[?] help",
-                    "[q] quit",
-                ],
-            )),
-        ],
-    };
+fn draw_repo_status_view(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width >= 140 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
+                Constraint::Percentage(40),
+            ])
+            .split(area);
+        draw_unstaged(frame, app, columns[0]);
+        draw_staged(frame, app, columns[1]);
+        draw_preview(frame, app, columns[2]);
+        return;
+    }
+
+    if area.width >= 96 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        let left_stack = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(columns[0]);
+        draw_unstaged(frame, app, left_stack[0]);
+        draw_staged(frame, app, left_stack[1]);
+        draw_preview(frame, app, columns[1]);
+        return;
+    }
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+    draw_unstaged(frame, app, rows[0]);
+    draw_staged(frame, app, rows[1]);
+    draw_preview(frame, app, rows[2]);
+}
+
+fn split_master_detail(area: Rect, master_percent: u16, detail_percent: u16) -> Vec<Rect> {
+    if area.width >= 96 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(master_percent),
+                Constraint::Percentage(detail_percent),
+            ])
+            .split(area)
+            .to_vec()
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+            .split(area)
+            .to_vec()
+    }
+}
+
+fn draw_footer(frame: &mut Frame, app: &App, _area: Rect) {
+    let lines = vec![
+        Line::from(app.status_message.clone()),
+        Line::from("[?] help | [q] quit | [r] refresh | [L] log"),
+    ];
 
     let footer = Paragraph::new(Text::from(lines))
         .block(Block::default().borders(Borders::ALL).title("Status"));
-    frame.render_widget(footer, area);
+    frame.render_widget(footer, _area);
 }
 
 fn draw_commit_popup(frame: &mut Frame, app: &App) {
-    let popup = centered_rect(70, 18, frame.area());
+    let popup = match app.input_mode {
+        InputMode::CommitBody => centered_rect_with_min(92, 45, frame.area(), 56, 10),
+        _ => centered_rect_with_min(82, 24, frame.area(), 52, 5),
+    };
+    let title = truncate_for_width(app.popup_title(), popup.width.saturating_sub(4) as usize);
     frame.render_widget(Clear, popup);
     let popup_text = popup_text_with_cursor(app);
     let input = Paragraph::new(popup_text)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(app.popup_title()),
+                .title(title),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(input, popup);
@@ -755,6 +581,18 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
     let cursor = app.popup_input_cursor().min(chars.len());
     let mut spans: Vec<Span<'static>> = Vec::new();
     for (idx, ch) in chars.iter().enumerate() {
+        if idx == cursor && *ch == '\n' {
+            spans.push(Span::styled(
+                " ".to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            continue;
+        }
+        if *ch == '\n' {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            continue;
+        }
         if idx == cursor {
             spans.push(Span::styled(
                 ch.to_string(),
@@ -771,14 +609,16 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
         ));
     }
 
-    if spans.is_empty() {
+    if spans.is_empty() && lines.is_empty() {
         spans.push(Span::styled(
             " ".to_string(),
             Style::default().add_modifier(Modifier::REVERSED),
         ));
     }
 
-    lines.push(Line::from(spans));
+    if !spans.is_empty() || lines.is_empty() {
+        lines.push(Line::from(spans));
+    }
     Text::from(lines)
 }
 
@@ -807,46 +647,6 @@ fn draw_help_popup(frame: &mut Frame, app: &App) {
     frame.render_widget(help, popup);
 }
 
-fn compose_compact_footer(width: u16, hints: &[&str]) -> String {
-    let available = width.saturating_sub(4) as usize;
-    if available == 0 {
-        return String::new();
-    }
-
-    let mut parts: Vec<String> = Vec::new();
-    for hint in hints {
-        let candidate = if parts.is_empty() {
-            hint.to_string()
-        } else {
-            format!("{} | {}", parts.join(" | "), hint)
-        };
-        if candidate.len() > available {
-            break;
-        }
-        parts.push((*hint).to_string());
-    }
-
-    if parts.is_empty() {
-        return truncate_for_width(hints.first().copied().unwrap_or(""), available);
-    }
-
-    let output = parts.join(" | ");
-    if output.len() <= available {
-        output
-    } else {
-        truncate_for_width(&output, available)
-    }
-}
-
-fn truncate_for_width(input: &str, width: usize) -> String {
-    if input.len() <= width {
-        return input.to_string();
-    }
-    if width <= 3 {
-        return ".".repeat(width);
-    }
-    format!("{}...", &input[..width - 3])
-}
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()
@@ -866,4 +666,37 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+fn centered_rect_with_min(
+    percent_x: u16,
+    percent_y: u16,
+    area: Rect,
+    min_width: u16,
+    min_height: u16,
+) -> Rect {
+    let max_width = area.width.saturating_sub(2).max(1);
+    let max_height = area.height.saturating_sub(2).max(1);
+    let desired_width = area.width.saturating_mul(percent_x).saturating_div(100);
+    let desired_height = area.height.saturating_mul(percent_y).saturating_div(100);
+    let width = desired_width.max(min_width).min(max_width);
+    let height = desired_height.max(min_height).min(max_height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+fn truncate_for_width(input: &str, width: usize) -> String {
+    let length = input.chars().count();
+    if length <= width {
+        return input.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let truncated: String = input.chars().take(width - 3).collect();
+    format!("{truncated}...")
 }

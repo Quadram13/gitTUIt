@@ -6,8 +6,8 @@ gitTUIt is a terminal UI for Git/Github workflows. I am currently using this for
 
 - explicit repo tracking(requires local storage)
 - stage/unstage/commit changes (subject + optional multiline body)
-- diff preview for selected file
-- history view with commit details, checkout (detached), and cherry-pick
+- diff and history views for files
+    - uses simple file tree implementation(influenced by gitui's filetreelist crate)
 - incoming/outgoing commit comparison against upstream tracking branch
 - stash manager (stash/apply/pop/drop with preview)
 - GitHub pull request view (list/filter/open/checkout via Github CLI)

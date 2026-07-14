@@ -16,7 +16,8 @@ use anyhow::{Result, anyhow};
 use crate::{
     diagnostics,
     git::{
-        self, BranchEntry as GitBranchEntry, CommitEntry as GitCommitEntry, FileEntry,
+        self, BranchEntry as GitBranchEntry, CommitDetails as GitCommitDetails,
+        CommitEntry as GitCommitEntry, FileEntry,
         PullRequestMergeMethod as GitPullRequestMergeMethod,
         PullRequestEntry as GitPullRequestEntry, PullRequestFilter as GitPullRequestFilter,
         PullRequestStatusSummary as GitPullRequestStatusSummary,
@@ -41,12 +42,14 @@ const JOB_REPO_PREVIEW: &str = "repo_preview";
 const JOB_HISTORY_DETAILS: &str = "history_details";
 const JOB_STASH_DETAILS: &str = "stash_details";
 const JOB_HISTORY_ENTRIES: &str = "history_entries";
+const JOB_HISTORY_FILE_HISTORY: &str = "history_file_history";
 const JOB_STASH_ENTRIES: &str = "stash_entries";
 const JOB_PULL_REQUESTS: &str = "pull_requests";
 const JOB_PR_STATUS: &str = "pr_status";
 const JOB_TRACKING: &str = "tracking";
 const JOB_BRANCH_ENTRIES: &str = "branch_entries";
 const JOB_REMOTE_BRANCH_ENTRIES: &str = "remote_branch_entries";
+const JOB_FULLSCREEN_DIFF: &str = "fullscreen_diff";
 
 type AsyncTask = Box<dyn FnOnce() + Send + 'static>;
 
@@ -153,6 +156,13 @@ pub enum FocusPane {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFocusPane {
+    Commits,
+    ChangedFiles,
+    FileHistory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     RepoPicker,
     RepoBrowser,
@@ -200,7 +210,13 @@ enum AppAsyncEvent {
         request_id: u64,
         commit_hash: String,
         short_hash: String,
-        details: std::result::Result<String, String>,
+        details: std::result::Result<GitCommitDetails, String>,
+    },
+    HistoryFileHistoryReady {
+        request_id: u64,
+        commit_hash: String,
+        path: String,
+        entries: std::result::Result<Vec<GitCommitEntry>, String>,
     },
     StashDetailsReady {
         request_id: u64,
@@ -237,10 +253,27 @@ enum AppAsyncEvent {
         request_id: u64,
         entries: std::result::Result<Vec<GitRemoteBranchEntry>, String>,
     },
+    FullscreenDiffReady {
+        request_id: u64,
+        key: String,
+        title: String,
+        diff: std::result::Result<String, String>,
+    },
     WriteOpFinished {
         op: AsyncWriteOp,
         result: std::result::Result<(), String>,
     },
+}
+
+#[derive(Debug, Clone)]
+struct FullscreenDiffState {
+    key: String,
+    title: String,
+    lines: Vec<String>,
+    hunk_lines: Vec<usize>,
+    scroll_y: usize,
+    scroll_x: usize,
+    loading: bool,
 }
 
 enum AsyncWriteOp {
@@ -305,8 +338,14 @@ pub struct App {
     pub selected_stash: usize,
     stash_details: String,
     stash_details_for: Option<String>,
-    history_details: String,
+    history_details_visible: bool,
+    history_focus: HistoryFocusPane,
+    history_details: Option<GitCommitDetails>,
     history_details_for: Option<String>,
+    history_file_tree_selected: usize,
+    history_file_history_entries: Vec<GitCommitEntry>,
+    history_file_history_selected: usize,
+    history_file_history_for_path: Option<String>,
     pr_status_summary: Option<GitPullRequestStatusSummary>,
     pr_status_for: Option<u64>,
     pr_status_refresh_deadline: Option<Instant>,
@@ -335,6 +374,8 @@ pub struct App {
     stash_details_inflight: Option<u64>,
     history_entries_request_seq: u64,
     history_entries_inflight: Option<u64>,
+    history_file_history_request_seq: u64,
+    history_file_history_inflight: Option<u64>,
     stash_entries_request_seq: u64,
     stash_entries_inflight: Option<u64>,
     pull_requests_request_seq: u64,
@@ -347,6 +388,10 @@ pub struct App {
     branch_entries_inflight: Option<u64>,
     remote_branch_entries_request_seq: u64,
     remote_branch_entries_inflight: Option<u64>,
+    fullscreen_diff: Option<FullscreenDiffState>,
+    fullscreen_diff_request_seq: u64,
+    fullscreen_diff_inflight: Option<u64>,
+    fullscreen_diff_pending_key: Option<String>,
     async_job_lifecycle: HashMap<&'static str, AsyncJobLifecycle>,
     async_cancelled_jobs: u64,
     async_dispatch_failures: u64,
@@ -415,8 +460,14 @@ impl App {
             selected_stash: 0,
             stash_details: String::new(),
             stash_details_for: None,
-            history_details: String::new(),
+            history_details_visible: false,
+            history_focus: HistoryFocusPane::Commits,
+            history_details: None,
             history_details_for: None,
+            history_file_tree_selected: 0,
+            history_file_history_entries: Vec::new(),
+            history_file_history_selected: 0,
+            history_file_history_for_path: None,
             pr_status_summary: None,
             pr_status_for: None,
             pr_status_refresh_deadline: None,
@@ -445,6 +496,8 @@ impl App {
             stash_details_inflight: None,
             history_entries_request_seq: 0,
             history_entries_inflight: None,
+            history_file_history_request_seq: 0,
+            history_file_history_inflight: None,
             stash_entries_request_seq: 0,
             stash_entries_inflight: None,
             pull_requests_request_seq: 0,
@@ -457,6 +510,10 @@ impl App {
             branch_entries_inflight: None,
             remote_branch_entries_request_seq: 0,
             remote_branch_entries_inflight: None,
+            fullscreen_diff: None,
+            fullscreen_diff_request_seq: 0,
+            fullscreen_diff_inflight: None,
+            fullscreen_diff_pending_key: None,
             async_job_lifecycle: HashMap::new(),
             async_cancelled_jobs: 0,
             async_dispatch_failures: 0,
@@ -693,7 +750,9 @@ impl App {
                     "History",
                     &[
                         nav_items[0].clone(),
-                        "[Enter] load commit details".to_string(),
+                        "[Enter] toggle commit details".to_string(),
+                        "[Left]/[Right] move focus/open diff".to_string(),
+                        "[h] open file history from changed files".to_string(),
                         "[o] checkout selected commit (detached)".to_string(),
                         "[p] cherry-pick selected commit".to_string(),
                         "[b] back to status tab".to_string(),
@@ -761,6 +820,16 @@ impl App {
                         "[u]/[U] unstage selected/all staged".to_string(),
                         "[x] discard selected unstaged (confirm)".to_string(),
                         "[c] commit staged changes".to_string(),
+                        "[Right] open fullscreen diff (selected file)".to_string(),
+                    ],
+                );
+                section(
+                    "Fullscreen Diff",
+                    &[
+                        "[Esc] close viewer".to_string(),
+                        "[j]/[k]/[PgUp]/[PgDn]/[Home]/[End] scroll".to_string(),
+                        "[Left]/[Right] or [h]/[l] horizontal scroll".to_string(),
+                        "[n]/[p] next/prev hunk".to_string(),
                     ],
                 );
                 section(
@@ -908,7 +977,38 @@ impl App {
                 }
             }
             Screen::HistoryView => {
-                if !self.history_entries.is_empty() {
+                if self.history_details_visible {
+                    match self.history_focus {
+                        HistoryFocusPane::Commits => {
+                            if !self.history_entries.is_empty() {
+                                self.selected_history =
+                                    min(self.selected_history + 1, self.history_entries.len() - 1);
+                                self.clear_history_details();
+                                let _ = self.load_selected_commit_details();
+                            }
+                        }
+                        HistoryFocusPane::ChangedFiles => {
+                            let file_count = self
+                                .history_details
+                                .as_ref()
+                                .map(|details| details.files.len())
+                                .unwrap_or(0);
+                            if file_count > 0 {
+                                self.history_file_tree_selected =
+                                    min(self.history_file_tree_selected + 1, file_count - 1);
+                                self.clear_history_file_history();
+                            }
+                        }
+                        HistoryFocusPane::FileHistory => {
+                            if !self.history_file_history_entries.is_empty() {
+                                self.history_file_history_selected = min(
+                                    self.history_file_history_selected + 1,
+                                    self.history_file_history_entries.len() - 1,
+                                );
+                            }
+                        }
+                    }
+                } else if !self.history_entries.is_empty() {
                     self.selected_history = min(self.selected_history + 1, self.history_entries.len() - 1);
                     self.clear_history_details();
                 }
@@ -961,8 +1061,27 @@ impl App {
                 self.selected_remote_branch = self.selected_remote_branch.saturating_sub(1);
             }
             Screen::HistoryView => {
-                self.selected_history = self.selected_history.saturating_sub(1);
-                self.clear_history_details();
+                if self.history_details_visible {
+                    match self.history_focus {
+                        HistoryFocusPane::Commits => {
+                            self.selected_history = self.selected_history.saturating_sub(1);
+                            self.clear_history_details();
+                            let _ = self.load_selected_commit_details();
+                        }
+                        HistoryFocusPane::ChangedFiles => {
+                            self.history_file_tree_selected =
+                                self.history_file_tree_selected.saturating_sub(1);
+                            self.clear_history_file_history();
+                        }
+                        HistoryFocusPane::FileHistory => {
+                            self.history_file_history_selected =
+                                self.history_file_history_selected.saturating_sub(1);
+                        }
+                    }
+                } else {
+                    self.selected_history = self.selected_history.saturating_sub(1);
+                    self.clear_history_details();
+                }
             }
             Screen::PullRequestView => {
                 self.selected_pr = self.selected_pr.saturating_sub(1);
@@ -994,7 +1113,7 @@ impl App {
             Screen::RepoBrowser => self.browser_enter_selected(),
             Screen::BranchPicker => self.switch_selected_branch(),
             Screen::RemoteBranchPicker => self.checkout_selected_remote_branch(),
-            Screen::HistoryView => self.load_selected_commit_details(),
+            Screen::HistoryView => self.toggle_history_details(),
             Screen::PullRequestView => self.open_selected_pr_in_browser(),
             Screen::TrackingStatusView => Ok(()),
             Screen::StashView => self.load_selected_stash_details(),
@@ -1078,6 +1197,7 @@ impl App {
         self.pending_pr_title = None;
         self.pending_commit_subject = None;
         self.schedule_repo_preview_refresh();
+        self.close_fullscreen_diff();
         self.status_message = "Repository view".to_string();
     }
 
@@ -1439,6 +1559,9 @@ impl App {
         self.pending_pr_title = None;
         self.pending_commit_subject = None;
         self.clear_history_details();
+        self.clear_history_file_history();
+        self.history_details_visible = false;
+        self.history_focus = HistoryFocusPane::Commits;
         self.clear_pr_status_summary();
         self.invalidate_repo_preview_cache();
         self.repo_preview_refresh_deadline = None;
@@ -1456,6 +1579,10 @@ impl App {
         self.tracking_inflight = None;
         self.branch_entries_inflight = None;
         self.remote_branch_entries_inflight = None;
+        self.history_file_history_inflight = None;
+        self.fullscreen_diff_inflight = None;
+        self.fullscreen_diff_pending_key = None;
+        self.close_fullscreen_diff();
         self.write_inflight = false;
         self.status_message = "Main menu".to_string();
     }
@@ -2167,13 +2294,43 @@ impl App {
                     }
                     match details {
                         Ok(details) => {
-                            self.history_details = truncate_lines(details, 240);
+                            self.history_details = Some(details);
                             self.history_details_for = Some(commit_hash);
+                            self.history_file_tree_selected = 0;
+                            self.clear_history_file_history();
                             self.status_message = format!("Loaded commit details {}", short_hash);
                         }
                         Err(err) => {
                             self.set_async_error_status("Commit details", &err);
                         }
+                    }
+                }
+                AppAsyncEvent::HistoryFileHistoryReady {
+                    request_id,
+                    commit_hash,
+                    path,
+                    entries,
+                } => {
+                    if self.history_file_history_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.history_file_history_inflight = None;
+                    if self.history_entries.get(self.selected_history).map(|entry| entry.hash.as_str())
+                        != Some(commit_hash.as_str())
+                    {
+                        continue;
+                    }
+                    if self.history_file_history_for_path.as_deref() != Some(path.as_str()) {
+                        continue;
+                    }
+                    match entries {
+                        Ok(entries) => {
+                            self.history_file_history_entries = entries;
+                            self.history_file_history_selected = 0;
+                            self.history_focus = HistoryFocusPane::FileHistory;
+                            self.status_message = format!("Loaded history for {}", path);
+                        }
+                        Err(err) => self.set_async_error_status("File history", &err),
                     }
                 }
                 AppAsyncEvent::StashDetailsReady {
@@ -2214,6 +2371,9 @@ impl App {
                                 self.history_entries.len().saturating_sub(1),
                             );
                             self.clear_history_details();
+                            if self.history_details_visible {
+                                let _ = self.load_selected_commit_details();
+                            }
                         }
                         Err(err) => {
                             self.set_async_error_status("History refresh", &err);
@@ -2329,6 +2489,35 @@ impl App {
                             );
                         }
                         Err(err) => self.set_async_error_status("Remote branch refresh", &err),
+                    }
+                }
+                AppAsyncEvent::FullscreenDiffReady {
+                    request_id,
+                    key,
+                    title,
+                    diff,
+                } => {
+                    if self.fullscreen_diff_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.fullscreen_diff_inflight = None;
+                    self.fullscreen_diff_pending_key = None;
+                    if self.fullscreen_diff.as_ref().map(|state| state.key.as_str()) != Some(key.as_str()) {
+                        continue;
+                    }
+                    match diff {
+                        Ok(diff) => {
+                            self.set_fullscreen_diff_content(&title, &key, &diff);
+                            self.status_message = format!("Opened diff viewer: {}", title);
+                        }
+                        Err(err) => {
+                            self.set_fullscreen_diff_content(
+                                &title,
+                                &key,
+                                &format!("Unable to load diff:\n{err}"),
+                            );
+                            self.set_async_error_status("Diff viewer", &err);
+                        }
                     }
                 }
                 AppAsyncEvent::WriteOpFinished { op, result } => {
@@ -2729,6 +2918,226 @@ impl App {
             return Err(err);
         }
         Ok(())
+    }
+
+    pub fn is_fullscreen_diff_visible(&self) -> bool {
+        self.fullscreen_diff.is_some()
+    }
+
+    pub fn fullscreen_diff_title(&self) -> Option<&str> {
+        self.fullscreen_diff.as_ref().map(|state| state.title.as_str())
+    }
+
+    pub fn fullscreen_diff_scroll_position(&self) -> Option<(usize, usize)> {
+        self.fullscreen_diff
+            .as_ref()
+            .map(|state| (state.scroll_y, state.scroll_x))
+    }
+
+    pub fn fullscreen_diff_visible_lines(&self, width: usize, height: usize) -> Vec<String> {
+        let Some(state) = self.fullscreen_diff.as_ref() else {
+            return Vec::new();
+        };
+        if state.loading {
+            return vec!["Loading diff...".to_string()];
+        }
+        let body_width = width.max(1);
+        state
+            .lines
+            .iter()
+            .skip(state.scroll_y)
+            .take(height.max(1))
+            .map(|line| {
+                let chars = line.chars().collect::<Vec<_>>();
+                let start = state.scroll_x.min(chars.len());
+                chars
+                    .iter()
+                    .skip(start)
+                    .take(body_width)
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    pub fn close_fullscreen_diff(&mut self) {
+        self.fullscreen_diff = None;
+        self.fullscreen_diff_inflight = None;
+        self.fullscreen_diff_pending_key = None;
+    }
+
+    pub fn open_status_fullscreen_diff(&mut self) -> Result<()> {
+        if self.screen != Screen::RepoView {
+            return Ok(());
+        }
+        let Some(root) = self.repo_root.clone() else {
+            return Ok(());
+        };
+        let (path, staged) = match self.focus {
+            FocusPane::Unstaged => self
+                .current_unstaged()
+                .map(|entry| (entry.path.clone(), false))
+                .ok_or_else(|| anyhow!("No unstaged file selected"))?,
+            FocusPane::Staged => self
+                .current_staged()
+                .map(|entry| (entry.path.clone(), true))
+                .ok_or_else(|| anyhow!("No staged file selected"))?,
+        };
+        let title = if staged {
+            format!("Staged Diff: {path}")
+        } else {
+            format!("Unstaged Diff: {path}")
+        };
+        let key = format!("status:{}:{path}", if staged { "staged" } else { "unstaged" });
+        self.request_fullscreen_diff(title, key, move || git::diff_for_file(&root, &path, staged))?;
+        Ok(())
+    }
+
+    pub fn fullscreen_diff_move_down(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        if state.lines.is_empty() {
+            return;
+        }
+        state.scroll_y = min(state.scroll_y.saturating_add(1), state.lines.len().saturating_sub(1));
+    }
+
+    pub fn fullscreen_diff_move_up(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_y = state.scroll_y.saturating_sub(1);
+        }
+    }
+
+    pub fn fullscreen_diff_page_down(&mut self, page_height: usize) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        if state.lines.is_empty() {
+            return;
+        }
+        state.scroll_y = min(
+            state.scroll_y.saturating_add(page_height.max(1)),
+            state.lines.len().saturating_sub(1),
+        );
+    }
+
+    pub fn fullscreen_diff_page_up(&mut self, page_height: usize) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_y = state.scroll_y.saturating_sub(page_height.max(1));
+        }
+    }
+
+    pub fn fullscreen_diff_home(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_y = 0;
+        }
+    }
+
+    pub fn fullscreen_diff_end(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        if !state.lines.is_empty() {
+            state.scroll_y = state.lines.len().saturating_sub(1);
+        }
+    }
+
+    pub fn fullscreen_diff_scroll_left(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_x = state.scroll_x.saturating_sub(4);
+        }
+    }
+
+    pub fn fullscreen_diff_scroll_right(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_x = state.scroll_x.saturating_add(4);
+        }
+    }
+
+    pub fn fullscreen_diff_next_hunk(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        let target = state
+            .hunk_lines
+            .iter()
+            .copied()
+            .find(|line| *line > state.scroll_y);
+        if let Some(target) = target {
+            state.scroll_y = target;
+        }
+    }
+
+    pub fn fullscreen_diff_prev_hunk(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        let target = state
+            .hunk_lines
+            .iter()
+            .copied()
+            .rev()
+            .find(|line| *line < state.scroll_y);
+        if let Some(target) = target {
+            state.scroll_y = target;
+        }
+    }
+
+    fn request_fullscreen_diff<F>(&mut self, title: String, key: String, load: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<String> + Send + 'static,
+    {
+        self.fullscreen_diff = Some(FullscreenDiffState {
+            key: key.clone(),
+            title: title.clone(),
+            lines: vec!["Loading diff...".to_string()],
+            hunk_lines: Vec::new(),
+            scroll_y: 0,
+            scroll_x: 0,
+            loading: true,
+        });
+        self.fullscreen_diff_request_seq = self.fullscreen_diff_request_seq.saturating_add(1);
+        let request_id = self.fullscreen_diff_request_seq;
+        self.fullscreen_diff_inflight = Some(request_id);
+        self.fullscreen_diff_pending_key = Some(key.clone());
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_FULLSCREEN_DIFF, request_id, move || {
+            let diff = load().map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::FullscreenDiffReady {
+                request_id,
+                key,
+                title,
+                diff,
+            });
+        }) {
+            self.fullscreen_diff_inflight = None;
+            self.fullscreen_diff_pending_key = None;
+            self.close_fullscreen_diff();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn set_fullscreen_diff_content(&mut self, title: &str, key: &str, diff: &str) {
+        let lines = if diff.is_empty() {
+            vec!["(No diff output)".to_string()]
+        } else {
+            diff.lines().map(|line| line.to_string()).collect::<Vec<_>>()
+        };
+        let hunk_lines = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.starts_with("@@").then_some(idx))
+            .collect::<Vec<_>>();
+        self.fullscreen_diff = Some(FullscreenDiffState {
+            key: key.to_string(),
+            title: title.to_string(),
+            lines,
+            hunk_lines,
+            scroll_y: 0,
+            scroll_x: 0,
+            loading: false,
+        });
     }
 
     fn request_repo_preview_refresh(&mut self) {

@@ -13,8 +13,9 @@ pub use branches::{
     list_local_branches, list_remote_branches, switch_branch,
 };
 pub use history::{
-    CommitEntry, TrackingCommitSummary, cherry_pick, cherry_pick_abort, cherry_pick_continue,
-    checkout_detached, commit_details, commit_history, tracking_commit_summary,
+    CommitDetails, CommitEntry, TrackingCommitSummary, cherry_pick, cherry_pick_abort,
+    cherry_pick_continue, checkout_detached, commit_details_structured, commit_file_diff,
+    commit_history, file_history, tracking_commit_summary,
 };
 pub use prs::{
     PullRequestEntry, PullRequestFilter, PullRequestMergeMethod, PullRequestStatusSummary,

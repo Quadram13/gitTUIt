@@ -2,6 +2,7 @@ mod app;
 mod diagnostics;
 mod git;
 mod repo_registry;
+mod tree;
 mod ui;
 
 use std::{env, time::Duration};
@@ -143,6 +144,26 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
             continue;
         }
 
+        if app.is_fullscreen_diff_visible() {
+            match key.code {
+                KeyCode::Esc => app.close_fullscreen_diff(),
+                KeyCode::Down | KeyCode::Char('j') => app.fullscreen_diff_move_down(),
+                KeyCode::Up | KeyCode::Char('k') => app.fullscreen_diff_move_up(),
+                KeyCode::PageDown => app.fullscreen_diff_page_down(20),
+                KeyCode::PageUp => app.fullscreen_diff_page_up(20),
+                KeyCode::Home => app.fullscreen_diff_home(),
+                KeyCode::End => app.fullscreen_diff_end(),
+                KeyCode::Char('n') => app.fullscreen_diff_next_hunk(),
+                KeyCode::Char('p') => app.fullscreen_diff_prev_hunk(),
+                KeyCode::Left => app.fullscreen_diff_scroll_left(),
+                KeyCode::Right => app.fullscreen_diff_scroll_right(),
+                KeyCode::Char('h') => app.fullscreen_diff_scroll_left(),
+                KeyCode::Char('l') => app.fullscreen_diff_scroll_right(),
+                _ => {}
+            }
+            continue;
+        }
+
         let mut action_result: Option<Result<()>> = None;
         match key.code {
             KeyCode::Char('q') => break,
@@ -158,6 +179,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
             KeyCode::Down | KeyCode::Char('j') => app.move_next(),
             KeyCode::Up | KeyCode::Char('k') => app.move_prev(),
             KeyCode::Tab => app.cycle_focus(),
+            KeyCode::Left if app.screen == Screen::HistoryView => app.history_focus_left(),
+            KeyCode::Left if app.screen == Screen::RepoView => app.status_tree_focus_left(),
+            KeyCode::Right if app.screen == Screen::RepoView => {
+                action_result = Some(app.status_tree_focus_right())
+            }
+            KeyCode::Right if app.screen == Screen::HistoryView => {
+                action_result = Some(app.history_focus_right())
+            }
             KeyCode::Backspace if app.screen == Screen::RepoBrowser => {
                 action_result = Some(app.browser_go_parent())
             }
@@ -213,6 +242,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
             }
             KeyCode::Char('p') if app.screen == Screen::HistoryView => {
                 action_result = Some(app.cherry_pick_selected_commit())
+            }
+            KeyCode::Char('h') if app.screen == Screen::HistoryView => {
+                action_result = Some(app.open_selected_history_file_history())
             }
             KeyCode::Char('o') if app.screen == Screen::PullRequestView => {
                 action_result = Some(app.open_selected_pr_in_browser())

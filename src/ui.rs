@@ -6,7 +6,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, FocusPane, InputMode, Screen};
+use crate::app::{App, FocusPane, HistoryFocusPane, InputMode, Screen};
+use crate::tree::changed_files_tree::TreeRowKind;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let root = frame.area();
@@ -90,6 +91,10 @@ fn workspace_tabs_line(app: &App) -> Line<'static> {
 }
 
 fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
+    if app.is_fullscreen_diff_visible() {
+        draw_fullscreen_diff(frame, app, area);
+        return;
+    }
     if app.screen == Screen::RepoPicker {
         draw_repo_picker(frame, app, area);
         return;
@@ -250,7 +255,37 @@ fn draw_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_history_view(frame: &mut Frame, app: &App, area: Rect) {
-    let columns = split_master_detail(area, 55, 45);
+    if !app.history_details_visible() {
+        let items = if app.history_entries.is_empty() {
+            vec![ListItem::new("No commits found")]
+        } else {
+            app.history_entries
+                .iter()
+                .map(|entry| {
+                    ListItem::new(format!(
+                        "{} {} ({}, {})",
+                        entry.short_hash, entry.summary, entry.author, entry.relative_time
+                    ))
+                })
+                .collect()
+        };
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("History ([Enter] show details)"),
+            )
+            .highlight_style(Style::default().bg(Color::DarkGray))
+            .highlight_symbol("> ");
+        let mut state = ListState::default();
+        if !app.history_entries.is_empty() {
+            state.select(Some(app.selected_history));
+        }
+        frame.render_stateful_widget(list, area, &mut state);
+        return;
+    }
+
+    let columns = split_master_detail(area, 45, 55);
 
     let items = if app.history_entries.is_empty() {
         vec![ListItem::new("No commits found")]
@@ -266,11 +301,17 @@ fn draw_history_view(frame: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
 
+    let list_border_style = if app.history_focus() == HistoryFocusPane::Commits {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("History"),
+                .title("History ([Enter] hide details)")
+                .border_style(list_border_style),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
@@ -281,10 +322,46 @@ fn draw_history_view(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_stateful_widget(list, columns[0], &mut state);
 
-    let details = Paragraph::new(app.preview_text())
-        .block(Block::default().borders(Borders::ALL).title("Commit Details"))
+    let detail_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6),
+            Constraint::Percentage(35),
+            Constraint::Min(6),
+        ])
+        .split(columns[1]);
+    let metadata = Paragraph::new(app.history_metadata_text())
+        .block(Block::default().borders(Borders::ALL).title("Metadata"))
         .wrap(Wrap { trim: false });
-    frame.render_widget(details, columns[1]);
+    frame.render_widget(metadata, detail_rows[0]);
+
+    let message = Paragraph::new(app.history_message_text())
+        .block(Block::default().borders(Borders::ALL).title("Message"))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(message, detail_rows[1]);
+
+    let file_border_style = if app.history_focus() != HistoryFocusPane::Commits {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let file_items = app
+        .history_files_items()
+        .into_iter()
+        .map(ListItem::new)
+        .collect::<Vec<_>>();
+    let files = List::new(file_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.history_files_title())
+                .border_style(file_border_style),
+        )
+        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ");
+    let mut files_state = ListState::default();
+    files_state.select(app.history_files_selected_index());
+    frame.render_stateful_widget(files, detail_rows[2], &mut files_state);
 }
 
 fn draw_remote_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -401,13 +478,28 @@ fn draw_stash_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_unstaged(frame: &mut Frame, app: &App, area: Rect) {
-    let items = if app.snapshot.unstaged.is_empty() {
+    let items = if app.unstaged_tree_rows().is_empty() {
         vec![ListItem::new("No unstaged changes")]
     } else {
-        app.snapshot
-            .unstaged
+        app.unstaged_tree_rows()
             .iter()
-            .map(|entry| ListItem::new(format!("[{}] {}", entry.status, entry.path)))
+            .map(|entry| {
+                let indent = "  ".repeat(entry.depth);
+                let label = match entry.kind {
+                    TreeRowKind::Directory => {
+                        let marker = if entry.expanded { "[-]" } else { "[+]" };
+                        format!("{indent}{marker} {}", entry.name)
+                    }
+                    TreeRowKind::File => {
+                        format!(
+                            "{indent}[{}] {}",
+                            entry.status.as_deref().unwrap_or("?"),
+                            entry.name
+                        )
+                    }
+                };
+                ListItem::new(label)
+            })
             .collect()
     };
     let border_style = if app.focus == FocusPane::Unstaged {
@@ -419,27 +511,42 @@ fn draw_unstaged(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Unstaged ([s/S] stage/all, [x] discard)")
+                .title("Unstaged ([s/S] stage/all, [x] discard file, [Left/Right] fold/expand)")
                 .border_style(border_style),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
     let mut state = ListState::default();
-    if !app.snapshot.unstaged.is_empty() {
+    if !app.unstaged_tree_rows().is_empty() {
         state.select(Some(app.selected_unstaged));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_staged(frame: &mut Frame, app: &App, area: Rect) {
-    let items = if app.snapshot.staged.is_empty() {
+    let items = if app.staged_tree_rows().is_empty() {
         vec![ListItem::new("No staged changes")]
     } else {
-        app.snapshot
-            .staged
+        app.staged_tree_rows()
             .iter()
-            .map(|entry| ListItem::new(format!("[{}] {}", entry.status, entry.path)))
+            .map(|entry| {
+                let indent = "  ".repeat(entry.depth);
+                let label = match entry.kind {
+                    TreeRowKind::Directory => {
+                        let marker = if entry.expanded { "[-]" } else { "[+]" };
+                        format!("{indent}{marker} {}", entry.name)
+                    }
+                    TreeRowKind::File => {
+                        format!(
+                            "{indent}[{}] {}",
+                            entry.status.as_deref().unwrap_or("?"),
+                            entry.name
+                        )
+                    }
+                };
+                ListItem::new(label)
+            })
             .collect()
     };
     let border_style = if app.focus == FocusPane::Staged {
@@ -451,21 +558,21 @@ fn draw_staged(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Staged ([u/U] unstage/all, [c] commit)")
+                .title("Staged ([u/U] unstage/all, [c] commit, [Left/Right] fold/expand)")
                 .border_style(border_style),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
     let mut state = ListState::default();
-    if !app.snapshot.staged.is_empty() {
+    if !app.staged_tree_rows().is_empty() {
         state.select(Some(app.selected_staged));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
-    let preview = Paragraph::new(app.preview_text())
+    let preview = Paragraph::new(diff_colored_text(&app.preview_text()))
         .block(Block::default().borders(Borders::ALL).title("Preview / Output"))
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, area);
@@ -545,6 +652,55 @@ fn draw_footer(frame: &mut Frame, app: &App, _area: Rect) {
     frame.render_widget(footer, _area);
 }
 
+fn draw_fullscreen_diff(frame: &mut Frame, app: &App, area: Rect) {
+    let body_height = area.height.saturating_sub(2) as usize;
+    let body_width = area.width.saturating_sub(2) as usize;
+    let visible_lines = app.fullscreen_diff_visible_lines(body_width, body_height);
+    let (scroll_y, scroll_x) = app.fullscreen_diff_scroll_position().unwrap_or((0, 0));
+    let title = app
+        .fullscreen_diff_title()
+        .map(|title| {
+            format!(
+                "{title} (y:{scroll_y} x:{scroll_x}) [Esc] close | [j/k] scroll | [Left/Right]/[h/l] horizontal | [n/p] hunks"
+            )
+        })
+        .unwrap_or_else(|| "Diff Viewer".to_string());
+    let paragraph = Paragraph::new(diff_colored_text_from_lines(visible_lines))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+fn diff_colored_text(input: &str) -> Text<'static> {
+    let lines = input.lines().map(|line| colorize_diff_line(line.to_string())).collect::<Vec<_>>();
+    Text::from(lines)
+}
+
+fn diff_colored_text_from_lines(lines: Vec<String>) -> Text<'static> {
+    Text::from(
+        lines
+            .into_iter()
+            .map(colorize_diff_line)
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn colorize_diff_line(line: String) -> Line<'static> {
+    if line.starts_with("+++") || line.starts_with("---") {
+        return Line::from(Span::styled(line, Style::default().fg(Color::Yellow)));
+    }
+    if line.starts_with("@@") {
+        return Line::from(Span::styled(line, Style::default().fg(Color::Cyan)));
+    }
+    if line.starts_with('+') {
+        return Line::from(Span::styled(line, Style::default().fg(Color::Green)));
+    }
+    if line.starts_with('-') {
+        return Line::from(Span::styled(line, Style::default().fg(Color::Red)));
+    }
+    Line::from(line)
+}
+
 fn draw_commit_popup(frame: &mut Frame, app: &App) {
     let popup = match app.input_mode {
         InputMode::CommitBody => centered_rect_with_min(92, 45, frame.area(), 56, 10),
@@ -552,20 +708,35 @@ fn draw_commit_popup(frame: &mut Frame, app: &App) {
     };
     let title = truncate_for_width(app.popup_title(), popup.width.saturating_sub(4) as usize);
     frame.render_widget(Clear, popup);
-    let popup_text = popup_text_with_cursor(app);
+    let (popup_text, cursor_line, cursor_col) = popup_text_with_cursor(app);
+    let body_height = popup.height.saturating_sub(2) as usize;
+    let body_width = popup.width.saturating_sub(2) as usize;
+    let scroll_y = if body_height == 0 {
+        0
+    } else {
+        cursor_line.saturating_sub(body_height.saturating_sub(1))
+    };
+    let scroll_x = if body_width == 0 {
+        0
+    } else {
+        cursor_col.saturating_sub(body_width.saturating_sub(1))
+    };
     let input = Paragraph::new(popup_text)
+        .scroll((
+            scroll_y.min(u16::MAX as usize) as u16,
+            scroll_x.min(u16::MAX as usize) as u16,
+        ))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title),
-        )
-        .wrap(Wrap { trim: false });
+        );
     frame.render_widget(input, popup);
 }
 
-fn popup_text_with_cursor(app: &App) -> Text<'static> {
+fn popup_text_with_cursor(app: &App) -> (Text<'static>, usize, usize) {
     let Some(input) = app.popup_input_text() else {
-        return Text::from(app.popup_body());
+        return (Text::from(app.popup_body()), 0, 0);
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -579,21 +750,39 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
 
     let chars = input.chars().collect::<Vec<_>>();
     let cursor = app.popup_input_cursor().min(chars.len());
+    let mut input_cursor_col = 0usize;
+    for ch in chars.iter().take(cursor) {
+        if *ch == '\n' {
+            input_cursor_col = 0;
+        } else {
+            input_cursor_col += 1;
+        }
+    }
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_line_idx = lines.len();
+    let mut cursor_line: Option<usize> = None;
     for (idx, ch) in chars.iter().enumerate() {
         if idx == cursor && *ch == '\n' {
+            if cursor_line.is_none() {
+                cursor_line = Some(current_line_idx);
+            }
             spans.push(Span::styled(
                 " ".to_string(),
                 Style::default().add_modifier(Modifier::REVERSED),
             ));
             lines.push(Line::from(std::mem::take(&mut spans)));
+            current_line_idx += 1;
             continue;
         }
         if *ch == '\n' {
             lines.push(Line::from(std::mem::take(&mut spans)));
+            current_line_idx += 1;
             continue;
         }
         if idx == cursor {
+            if cursor_line.is_none() {
+                cursor_line = Some(current_line_idx);
+            }
             spans.push(Span::styled(
                 ch.to_string(),
                 Style::default().add_modifier(Modifier::REVERSED),
@@ -603,6 +792,9 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
         }
     }
     if cursor == chars.len() {
+        if cursor_line.is_none() {
+            cursor_line = Some(current_line_idx);
+        }
         spans.push(Span::styled(
             " ".to_string(),
             Style::default().add_modifier(Modifier::REVERSED),
@@ -619,7 +811,11 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
     if !spans.is_empty() || lines.is_empty() {
         lines.push(Line::from(spans));
     }
-    Text::from(lines)
+    (
+        Text::from(lines),
+        cursor_line.unwrap_or(current_line_idx),
+        input_cursor_col,
+    )
 }
 
 fn draw_help_popup(frame: &mut Frame, app: &App) {

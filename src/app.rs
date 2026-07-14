@@ -1,7 +1,13 @@
 use std::{
     cmp::min,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
+    },
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -10,7 +16,8 @@ use anyhow::{Result, anyhow};
 use crate::{
     diagnostics,
     git::{
-        self, BranchEntry as GitBranchEntry, CommitEntry as GitCommitEntry, FileEntry,
+        self, BranchEntry as GitBranchEntry, CommitDetails as GitCommitDetails,
+        CommitEntry as GitCommitEntry,
         PullRequestMergeMethod as GitPullRequestMergeMethod,
         PullRequestEntry as GitPullRequestEntry, PullRequestFilter as GitPullRequestFilter,
         PullRequestStatusSummary as GitPullRequestStatusSummary,
@@ -18,6 +25,7 @@ use crate::{
         TrackingCommitSummary as GitTrackingCommitSummary,
     },
     repo_registry::{RepoRegistry, canonical_repo_path, normalize_repo_path_input},
+    tree::changed_files_tree::{ChangedFilesTree, FileLeaf, TreeRow, TreeRowKind},
 };
 
 mod pull_requests;
@@ -26,10 +34,133 @@ mod history;
 mod stash;
 mod tracking;
 
+const ASYNC_WORKER_COUNT: usize = 4;
+const ASYNC_QUEUE_CAPACITY: usize = 96;
+
+const JOB_WRITE: &str = "write";
+const JOB_SNAPSHOT: &str = "snapshot";
+const JOB_REPO_PREVIEW: &str = "repo_preview";
+const JOB_HISTORY_DETAILS: &str = "history_details";
+const JOB_STASH_DETAILS: &str = "stash_details";
+const JOB_HISTORY_ENTRIES: &str = "history_entries";
+const JOB_HISTORY_FILE_HISTORY: &str = "history_file_history";
+const JOB_STASH_ENTRIES: &str = "stash_entries";
+const JOB_PULL_REQUESTS: &str = "pull_requests";
+const JOB_PR_STATUS: &str = "pr_status";
+const JOB_TRACKING: &str = "tracking";
+const JOB_BRANCH_ENTRIES: &str = "branch_entries";
+const JOB_REMOTE_BRANCH_ENTRIES: &str = "remote_branch_entries";
+const JOB_FULLSCREEN_DIFF: &str = "fullscreen_diff";
+
+type AsyncTask = Box<dyn FnOnce() + Send + 'static>;
+
+enum AsyncWorkerMessage {
+    Run(AsyncTask),
+}
+
+#[derive(Clone)]
+struct AsyncScheduler {
+    tx: SyncSender<AsyncWorkerMessage>,
+    latest_tokens: Arc<Mutex<HashMap<&'static str, u64>>>,
+}
+
+impl AsyncScheduler {
+    fn new(worker_count: usize, queue_capacity: usize) -> Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<AsyncWorkerMessage>(queue_capacity);
+        let shared_rx = Arc::new(Mutex::new(rx));
+        for idx in 0..worker_count {
+            let worker_rx = Arc::clone(&shared_rx);
+            let thread_name = format!("gittuit-async-{idx}");
+            thread::Builder::new()
+                .name(thread_name)
+                .spawn(move || {
+                    loop {
+                        let message = {
+                            let Ok(guard) = worker_rx.lock() else {
+                                break;
+                            };
+                            guard.recv()
+                        };
+                        match message {
+                            Ok(AsyncWorkerMessage::Run(job)) => job(),
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .map_err(|err| anyhow!("failed to start async worker {idx}: {err}"))?;
+        }
+        Ok(Self {
+            tx,
+            latest_tokens: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    fn submit<F>(&self, job: F) -> std::result::Result<(), String>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.tx
+            .try_send(AsyncWorkerMessage::Run(Box::new(job)))
+            .map_err(format_async_queue_error)
+    }
+
+    fn submit_cancellable<F, C>(
+        &self,
+        key: &'static str,
+        token: u64,
+        on_cancel: C,
+        job: F,
+    ) -> std::result::Result<(), String>
+    where
+        F: FnOnce() + Send + 'static,
+        C: FnOnce() + Send + 'static,
+    {
+        if let Ok(mut latest) = self.latest_tokens.lock() {
+            latest.insert(key, token);
+        }
+        let latest_tokens = Arc::clone(&self.latest_tokens);
+        self.submit(move || {
+            let should_run = latest_tokens
+                .lock()
+                .ok()
+                .and_then(|latest| latest.get(key).copied())
+                == Some(token);
+            if should_run {
+                job();
+            } else {
+                on_cancel();
+            }
+        })
+    }
+}
+
+fn format_async_queue_error(err: TrySendError<AsyncWorkerMessage>) -> String {
+    match err {
+        TrySendError::Full(_) => {
+            "async queue is full; wait for background jobs to finish".to_string()
+        }
+        TrySendError::Disconnected(_) => "async queue is unavailable".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AsyncJobLifecycle {
+    Idle,
+    Queued,
+    Running,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusPane {
     Unstaged,
     Staged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFocusPane {
+    Commits,
+    ChangedFiles,
+    FileHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +190,120 @@ pub enum InputMode {
     ConfirmPullRequestMerge,
 }
 
+enum AppAsyncEvent {
+    JobState {
+        key: &'static str,
+        state: AsyncJobLifecycle,
+    },
+    JobCancelled {
+        key: &'static str,
+    },
+    SnapshotReady {
+        request_id: u64,
+        snapshot: std::result::Result<RepoSnapshot, String>,
+    },
+    RepoPreviewReady {
+        request_id: u64,
+        key: String,
+        preview: String,
+    },
+    HistoryDetailsReady {
+        request_id: u64,
+        commit_hash: String,
+        short_hash: String,
+        details: std::result::Result<GitCommitDetails, String>,
+    },
+    HistoryFileHistoryReady {
+        request_id: u64,
+        commit_hash: String,
+        path: String,
+        entries: std::result::Result<Vec<GitCommitEntry>, String>,
+    },
+    StashDetailsReady {
+        request_id: u64,
+        reference: String,
+        details: std::result::Result<String, String>,
+    },
+    HistoryEntriesReady {
+        request_id: u64,
+        entries: std::result::Result<Vec<GitCommitEntry>, String>,
+    },
+    StashEntriesReady {
+        request_id: u64,
+        entries: std::result::Result<Vec<GitStashEntry>, String>,
+    },
+    PullRequestsReady {
+        request_id: u64,
+        filter: GitPullRequestFilter,
+        entries: std::result::Result<Vec<GitPullRequestEntry>, String>,
+    },
+    PullRequestStatusReady {
+        request_id: u64,
+        pr_number: u64,
+        summary: std::result::Result<GitPullRequestStatusSummary, String>,
+    },
+    TrackingSummaryReady {
+        request_id: u64,
+        summary: std::result::Result<GitTrackingCommitSummary, String>,
+    },
+    BranchEntriesReady {
+        request_id: u64,
+        entries: std::result::Result<Vec<GitBranchEntry>, String>,
+    },
+    RemoteBranchEntriesReady {
+        request_id: u64,
+        entries: std::result::Result<Vec<GitRemoteBranchEntry>, String>,
+    },
+    FullscreenDiffReady {
+        request_id: u64,
+        key: String,
+        title: String,
+        diff: std::result::Result<String, String>,
+    },
+    WriteOpFinished {
+        op: AsyncWriteOp,
+        result: std::result::Result<(), String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct FullscreenDiffState {
+    key: String,
+    title: String,
+    lines: Vec<String>,
+    hunk_lines: Vec<usize>,
+    scroll_y: usize,
+    scroll_x: usize,
+    loading: bool,
+}
+
+enum AsyncWriteOp {
+    StageFile { path: String },
+    UnstageFile { path: String },
+    StageAll { total: usize },
+    UnstageAll { total: usize },
+    Fetch,
+    Pull,
+    Push,
+    CherryPickContinue,
+    CherryPickAbort,
+    DiscardFile { path: String, is_untracked: bool },
+    SwitchBranch { branch_name: String },
+    CheckoutRemoteBranch { branch_name: String },
+    CreateBranch { branch_name: String },
+    CheckoutPullRequest { number: u64 },
+    MergePullRequest { number: u64, method: GitPullRequestMergeMethod },
+    CreatePullRequest,
+    Commit,
+    StashPush,
+    StashApply { reference: String },
+    StashPop { reference: String },
+    StashDrop { reference: String },
+    CheckoutDetached { short_hash: String },
+    CherryPickCommit { short_hash: String },
+    OpenPrInBrowser { number: u64 },
+}
+
 pub struct App {
     pub screen: Screen,
     pub input_mode: InputMode,
@@ -81,6 +326,8 @@ pub struct App {
     pub repo_root: Option<PathBuf>,
     pub snapshot: RepoSnapshot,
     pub focus: FocusPane,
+    unstaged_tree: ChangedFilesTree,
+    staged_tree: ChangedFilesTree,
     pub selected_unstaged: usize,
     pub selected_staged: usize,
     pub status_message: String,
@@ -94,8 +341,15 @@ pub struct App {
     pub selected_stash: usize,
     stash_details: String,
     stash_details_for: Option<String>,
-    history_details: String,
+    history_details_visible: bool,
+    history_focus: HistoryFocusPane,
+    history_details: Option<GitCommitDetails>,
     history_details_for: Option<String>,
+    history_tree: ChangedFilesTree,
+    history_file_tree_selected: usize,
+    history_file_history_entries: Vec<GitCommitEntry>,
+    history_file_history_selected: usize,
+    history_file_history_for_path: Option<String>,
     pr_status_summary: Option<GitPullRequestStatusSummary>,
     pr_status_for: Option<u64>,
     pr_status_refresh_deadline: Option<Instant>,
@@ -109,6 +363,44 @@ pub struct App {
     repo_preview_key: Option<String>,
     repo_preview_text: String,
     repo_preview_refresh_deadline: Option<Instant>,
+    async_scheduler: AsyncScheduler,
+    async_tx: Sender<AppAsyncEvent>,
+    async_rx: Receiver<AppAsyncEvent>,
+    snapshot_request_seq: u64,
+    snapshot_inflight: Option<u64>,
+    snapshot_completion_message: Option<String>,
+    repo_preview_request_seq: u64,
+    repo_preview_inflight: Option<u64>,
+    repo_preview_pending_key: Option<String>,
+    history_details_request_seq: u64,
+    history_details_inflight: Option<u64>,
+    stash_details_request_seq: u64,
+    stash_details_inflight: Option<u64>,
+    history_entries_request_seq: u64,
+    history_entries_inflight: Option<u64>,
+    history_file_history_request_seq: u64,
+    history_file_history_inflight: Option<u64>,
+    stash_entries_request_seq: u64,
+    stash_entries_inflight: Option<u64>,
+    pull_requests_request_seq: u64,
+    pull_requests_inflight: Option<u64>,
+    pr_status_request_seq: u64,
+    pr_status_inflight: Option<u64>,
+    tracking_request_seq: u64,
+    tracking_inflight: Option<u64>,
+    branch_entries_request_seq: u64,
+    branch_entries_inflight: Option<u64>,
+    remote_branch_entries_request_seq: u64,
+    remote_branch_entries_inflight: Option<u64>,
+    fullscreen_diff: Option<FullscreenDiffState>,
+    fullscreen_diff_request_seq: u64,
+    fullscreen_diff_inflight: Option<u64>,
+    fullscreen_diff_pending_key: Option<String>,
+    async_job_lifecycle: HashMap<&'static str, AsyncJobLifecycle>,
+    async_cancelled_jobs: u64,
+    async_dispatch_failures: u64,
+    last_async_error: Option<String>,
+    write_inflight: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +427,8 @@ struct PendingPullRequestMerge {
 impl App {
     pub fn new() -> Result<Self> {
         let registry = RepoRegistry::load()?;
+        let (async_tx, async_rx) = mpsc::channel();
+        let async_scheduler = AsyncScheduler::new(ASYNC_WORKER_COUNT, ASYNC_QUEUE_CAPACITY)?;
         let mut app = Self {
             screen: Screen::RepoPicker,
             input_mode: InputMode::None,
@@ -157,6 +451,8 @@ impl App {
             repo_root: None,
             snapshot: RepoSnapshot::default(),
             focus: FocusPane::Unstaged,
+            unstaged_tree: ChangedFilesTree::default(),
+            staged_tree: ChangedFilesTree::default(),
             selected_unstaged: 0,
             selected_staged: 0,
             status_message: String::new(),
@@ -170,8 +466,15 @@ impl App {
             selected_stash: 0,
             stash_details: String::new(),
             stash_details_for: None,
-            history_details: String::new(),
+            history_details_visible: false,
+            history_focus: HistoryFocusPane::Commits,
+            history_details: None,
             history_details_for: None,
+            history_tree: ChangedFilesTree::default(),
+            history_file_tree_selected: 0,
+            history_file_history_entries: Vec::new(),
+            history_file_history_selected: 0,
+            history_file_history_for_path: None,
             pr_status_summary: None,
             pr_status_for: None,
             pr_status_refresh_deadline: None,
@@ -185,6 +488,44 @@ impl App {
             repo_preview_key: None,
             repo_preview_text: "No unstaged diff output for selected file.".to_string(),
             repo_preview_refresh_deadline: None,
+            async_scheduler,
+            async_tx,
+            async_rx,
+            snapshot_request_seq: 0,
+            snapshot_inflight: None,
+            snapshot_completion_message: None,
+            repo_preview_request_seq: 0,
+            repo_preview_inflight: None,
+            repo_preview_pending_key: None,
+            history_details_request_seq: 0,
+            history_details_inflight: None,
+            stash_details_request_seq: 0,
+            stash_details_inflight: None,
+            history_entries_request_seq: 0,
+            history_entries_inflight: None,
+            history_file_history_request_seq: 0,
+            history_file_history_inflight: None,
+            stash_entries_request_seq: 0,
+            stash_entries_inflight: None,
+            pull_requests_request_seq: 0,
+            pull_requests_inflight: None,
+            pr_status_request_seq: 0,
+            pr_status_inflight: None,
+            tracking_request_seq: 0,
+            tracking_inflight: None,
+            branch_entries_request_seq: 0,
+            branch_entries_inflight: None,
+            remote_branch_entries_request_seq: 0,
+            remote_branch_entries_inflight: None,
+            fullscreen_diff: None,
+            fullscreen_diff_request_seq: 0,
+            fullscreen_diff_inflight: None,
+            fullscreen_diff_pending_key: None,
+            async_job_lifecycle: HashMap::new(),
+            async_cancelled_jobs: 0,
+            async_dispatch_failures: 0,
+            last_async_error: None,
+            write_inflight: false,
         };
         app.rebuild_repo_picker_labels();
         app.refresh_browser_entries()?;
@@ -215,6 +556,7 @@ impl App {
     }
 
     pub fn tick(&mut self) {
+        self.process_async_events();
         self.maybe_refresh_pr_status_summary();
         self.maybe_refresh_repo_preview_cache();
     }
@@ -415,7 +757,9 @@ impl App {
                     "History",
                     &[
                         nav_items[0].clone(),
-                        "[Enter] load commit details".to_string(),
+                        "[Enter] toggle commit details".to_string(),
+                        "[Left]/[Right] move focus/open diff".to_string(),
+                        "[h] open file history from changed files".to_string(),
                         "[o] checkout selected commit (detached)".to_string(),
                         "[p] cherry-pick selected commit".to_string(),
                         "[b] back to status tab".to_string(),
@@ -483,6 +827,17 @@ impl App {
                         "[u]/[U] unstage selected/all staged".to_string(),
                         "[x] discard selected unstaged (confirm)".to_string(),
                         "[c] commit staged changes".to_string(),
+                        "[Right] expand folder / open file diff".to_string(),
+                        "[Left] collapse folder".to_string(),
+                    ],
+                );
+                section(
+                    "Fullscreen Diff",
+                    &[
+                        "[Esc] close viewer".to_string(),
+                        "[j]/[k]/[PgUp]/[PgDn]/[Home]/[End] scroll".to_string(),
+                        "[Left]/[Right] or [h]/[l] horizontal scroll".to_string(),
+                        "[n]/[p] next/prev hunk".to_string(),
                     ],
                 );
                 section(
@@ -561,7 +916,7 @@ impl App {
             }
             Screen::HistoryView => {
                 self.refresh_history_entries()?;
-                self.status_message = "Refreshed commit history".to_string();
+                self.set_async_running_status("Refreshing commit history");
             }
             Screen::PullRequestView => {
                 match self.refresh_pull_requests() {
@@ -582,16 +937,11 @@ impl App {
             }
             Screen::StashView => {
                 self.refresh_stash_entries()?;
-                self.status_message = "Refreshed stash list".to_string();
+                self.set_async_running_status("Refreshing stash list");
             }
             Screen::RepoView => {
-                let root = self.current_repo_root()?;
-                self.snapshot = git::snapshot(root)?;
-                self.refresh_last_fetch_from_git_metadata();
-                self.ensure_selection_bounds();
-                self.invalidate_repo_preview_cache();
-                self.schedule_repo_preview_refresh();
-                self.status_message = "Refreshed git status".to_string();
+                self.request_snapshot_refresh(Some("Refreshed git status".to_string()))?;
+                self.set_async_running_status("Refreshing git status");
             }
         }
         Ok(())
@@ -635,7 +985,34 @@ impl App {
                 }
             }
             Screen::HistoryView => {
-                if !self.history_entries.is_empty() {
+                if self.history_details_visible {
+                    match self.history_focus {
+                        HistoryFocusPane::Commits => {
+                            if !self.history_entries.is_empty() {
+                                self.selected_history =
+                                    min(self.selected_history + 1, self.history_entries.len() - 1);
+                                self.clear_history_details();
+                                let _ = self.load_selected_commit_details();
+                            }
+                        }
+                        HistoryFocusPane::ChangedFiles => {
+                            let file_count = self.history_tree.len();
+                            if file_count > 0 {
+                                self.history_file_tree_selected =
+                                    min(self.history_file_tree_selected + 1, file_count - 1);
+                                self.clear_history_file_history();
+                            }
+                        }
+                        HistoryFocusPane::FileHistory => {
+                            if !self.history_file_history_entries.is_empty() {
+                                self.history_file_history_selected = min(
+                                    self.history_file_history_selected + 1,
+                                    self.history_file_history_entries.len() - 1,
+                                );
+                            }
+                        }
+                    }
+                } else if !self.history_entries.is_empty() {
                     self.selected_history = min(self.selected_history + 1, self.history_entries.len() - 1);
                     self.clear_history_details();
                 }
@@ -655,16 +1032,16 @@ impl App {
             }
             Screen::RepoView => match self.focus {
                 FocusPane::Unstaged => {
-                    if !self.snapshot.unstaged.is_empty() {
+                    if self.unstaged_tree.len() > 0 {
                         self.selected_unstaged =
-                            min(self.selected_unstaged + 1, self.snapshot.unstaged.len() - 1);
+                            min(self.selected_unstaged + 1, self.unstaged_tree.len() - 1);
                         self.invalidate_repo_preview_cache();
                         self.schedule_repo_preview_refresh();
                     }
                 }
                 FocusPane::Staged => {
-                    if !self.snapshot.staged.is_empty() {
-                        self.selected_staged = min(self.selected_staged + 1, self.snapshot.staged.len() - 1);
+                    if self.staged_tree.len() > 0 {
+                        self.selected_staged = min(self.selected_staged + 1, self.staged_tree.len() - 1);
                         self.invalidate_repo_preview_cache();
                         self.schedule_repo_preview_refresh();
                     }
@@ -688,8 +1065,27 @@ impl App {
                 self.selected_remote_branch = self.selected_remote_branch.saturating_sub(1);
             }
             Screen::HistoryView => {
-                self.selected_history = self.selected_history.saturating_sub(1);
-                self.clear_history_details();
+                if self.history_details_visible {
+                    match self.history_focus {
+                        HistoryFocusPane::Commits => {
+                            self.selected_history = self.selected_history.saturating_sub(1);
+                            self.clear_history_details();
+                            let _ = self.load_selected_commit_details();
+                        }
+                        HistoryFocusPane::ChangedFiles => {
+                            self.history_file_tree_selected =
+                                self.history_file_tree_selected.saturating_sub(1);
+                            self.clear_history_file_history();
+                        }
+                        HistoryFocusPane::FileHistory => {
+                            self.history_file_history_selected =
+                                self.history_file_history_selected.saturating_sub(1);
+                        }
+                    }
+                } else {
+                    self.selected_history = self.selected_history.saturating_sub(1);
+                    self.clear_history_details();
+                }
             }
             Screen::PullRequestView => {
                 self.selected_pr = self.selected_pr.saturating_sub(1);
@@ -721,7 +1117,7 @@ impl App {
             Screen::RepoBrowser => self.browser_enter_selected(),
             Screen::BranchPicker => self.switch_selected_branch(),
             Screen::RemoteBranchPicker => self.checkout_selected_remote_branch(),
-            Screen::HistoryView => self.load_selected_commit_details(),
+            Screen::HistoryView => self.toggle_history_details(),
             Screen::PullRequestView => self.open_selected_pr_in_browser(),
             Screen::TrackingStatusView => Ok(()),
             Screen::StashView => self.load_selected_stash_details(),
@@ -805,6 +1201,7 @@ impl App {
         self.pending_pr_title = None;
         self.pending_commit_subject = None;
         self.schedule_repo_preview_refresh();
+        self.close_fullscreen_diff();
         self.status_message = "Repository view".to_string();
     }
 
@@ -951,28 +1348,40 @@ impl App {
     }
 
     pub fn stage_selected(&mut self) -> Result<()> {
-        let Some(entry) = self.current_unstaged() else {
-            self.status_message = "No unstaged file selected".to_string();
+        let Some(row) = self.current_unstaged_row() else {
+            self.status_message = "No unstaged path selected".to_string();
             return Ok(());
         };
-        let path = entry.path.clone();
+        let path = row.path.clone();
+        let label = match row.kind {
+            TreeRowKind::Directory => format!("Staging directory {}", path),
+            TreeRowKind::File => format!("Staging {}", path),
+        };
         let root = self.current_repo_root()?.to_path_buf();
-        git::stage_file(&root, &path)?;
-        self.refresh()?;
-        self.status_message = format!("Staged {}", path);
+        self.request_write_op(
+            &label,
+            AsyncWriteOp::StageFile { path: path.clone() },
+            move || git::stage_file(&root, &path),
+        );
         Ok(())
     }
 
     pub fn unstage_selected(&mut self) -> Result<()> {
-        let Some(entry) = self.current_staged() else {
-            self.status_message = "No staged file selected".to_string();
+        let Some(row) = self.current_staged_row() else {
+            self.status_message = "No staged path selected".to_string();
             return Ok(());
         };
-        let path = entry.path.clone();
+        let path = row.path.clone();
+        let label = match row.kind {
+            TreeRowKind::Directory => format!("Unstaging directory {}", path),
+            TreeRowKind::File => format!("Unstaging {}", path),
+        };
         let root = self.current_repo_root()?.to_path_buf();
-        git::unstage_file(&root, &path)?;
-        self.refresh()?;
-        self.status_message = format!("Unstaged {}", path);
+        self.request_write_op(
+            &label,
+            AsyncWriteOp::UnstageFile { path: path.clone() },
+            move || git::unstage_file(&root, &path),
+        );
         Ok(())
     }
 
@@ -983,9 +1392,11 @@ impl App {
         }
         let total = self.snapshot.unstaged.len();
         let root = self.current_repo_root()?.to_path_buf();
-        git::stage_all(&root)?;
-        self.refresh()?;
-        self.status_message = format!("Staged all unstaged files ({total})");
+        self.request_write_op(
+            "Staging all unstaged files",
+            AsyncWriteOp::StageAll { total },
+            move || git::stage_all(&root),
+        );
         Ok(())
     }
 
@@ -996,9 +1407,11 @@ impl App {
         }
         let total = self.snapshot.staged.len();
         let root = self.current_repo_root()?.to_path_buf();
-        git::unstage_all(&root)?;
-        self.refresh()?;
-        self.status_message = format!("Unstaged all staged files ({total})");
+        self.request_write_op(
+            "Unstaging all staged files",
+            AsyncWriteOp::UnstageAll { total },
+            move || git::unstage_all(&root),
+        );
         Ok(())
     }
 
@@ -1008,14 +1421,7 @@ impl App {
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
-        git::fetch(&root)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.refresh_last_fetch_from_git_metadata();
-        if self.screen == Screen::TrackingStatusView {
-            let _ = self.refresh_tracking_status_summary();
-        }
-        self.ensure_selection_bounds();
-        self.status_message = "Fetched remotes".to_string();
+        self.request_write_op("Fetching remotes", AsyncWriteOp::Fetch, move || git::fetch(&root));
         Ok(())
     }
 
@@ -1025,13 +1431,11 @@ impl App {
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
-        git::pull(&root)?;
-        self.snapshot = git::snapshot(&root)?;
-        if self.screen == Screen::TrackingStatusView {
-            let _ = self.refresh_tracking_status_summary();
-        }
-        self.ensure_selection_bounds();
-        self.status_message = "Pulled latest changes".to_string();
+        self.request_write_op(
+            "Pulling latest changes",
+            AsyncWriteOp::Pull,
+            move || git::pull(&root),
+        );
         Ok(())
     }
 
@@ -1041,13 +1445,9 @@ impl App {
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
-        git::push(&root)?;
-        self.snapshot = git::snapshot(&root)?;
-        if self.screen == Screen::TrackingStatusView {
-            let _ = self.refresh_tracking_status_summary();
-        }
-        self.ensure_selection_bounds();
-        self.status_message = "Pushed current branch".to_string();
+        self.request_write_op("Pushing current branch", AsyncWriteOp::Push, move || {
+            git::push(&root)
+        });
         Ok(())
     }
 
@@ -1057,10 +1457,11 @@ impl App {
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
-        git::cherry_pick_continue(&root)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.ensure_selection_bounds();
-        self.status_message = "Cherry-pick continued".to_string();
+        self.request_write_op(
+            "Continuing cherry-pick",
+            AsyncWriteOp::CherryPickContinue,
+            move || git::cherry_pick_continue(&root),
+        );
         Ok(())
     }
 
@@ -1070,21 +1471,26 @@ impl App {
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
-        git::cherry_pick_abort(&root)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.ensure_selection_bounds();
-        self.status_message = "Cherry-pick aborted".to_string();
+        self.request_write_op(
+            "Aborting cherry-pick",
+            AsyncWriteOp::CherryPickAbort,
+            move || git::cherry_pick_abort(&root),
+        );
         Ok(())
     }
 
     pub fn discard_selected_unstaged(&mut self) -> Result<()> {
-        let Some(entry) = self.current_unstaged() else {
+        let Some(entry) = self.current_unstaged_row() else {
             self.status_message = "No unstaged file selected".to_string();
             return Ok(());
         };
+        if entry.kind == TreeRowKind::Directory {
+            self.status_message = "Discard is file-only; select a file inside the folder".to_string();
+            return Ok(());
+        }
         self.pending_discard = Some(PendingDiscard {
             path: entry.path.clone(),
-            is_untracked: entry.status == "??",
+            is_untracked: entry.status.as_deref() == Some("??"),
         });
         self.input_mode = InputMode::ConfirmDiscard;
         self.status_message = "Confirm discard: [y] confirm, [n]/[Esc] cancel".to_string();
@@ -1099,14 +1505,17 @@ impl App {
         };
 
         let root = self.current_repo_root()?.to_path_buf();
-        git::discard_file(&root, &pending.path, pending.is_untracked)?;
+        let pending_path = pending.path.clone();
+        let pending_untracked = pending.is_untracked;
         self.input_mode = InputMode::None;
-        self.refresh()?;
-        if pending.is_untracked {
-            self.status_message = format!("Removed untracked {}", pending.path);
-        } else {
-            self.status_message = format!("Discarded unstaged changes in {}", pending.path);
-        }
+        self.request_write_op(
+            &format!("Discarding {}", pending_path),
+            AsyncWriteOp::DiscardFile {
+                path: pending_path.clone(),
+                is_untracked: pending_untracked,
+            },
+            move || git::discard_file(&root, &pending_path, pending_untracked),
+        );
         Ok(())
     }
 
@@ -1143,6 +1552,8 @@ impl App {
         self.screen = Screen::RepoPicker;
         self.repo_root = None;
         self.snapshot = RepoSnapshot::default();
+        self.unstaged_tree.clear();
+        self.staged_tree.clear();
         self.branch_entries.clear();
         self.selected_branch = 0;
         self.remote_branch_entries.clear();
@@ -1166,10 +1577,31 @@ impl App {
         self.pending_pr_title = None;
         self.pending_commit_subject = None;
         self.clear_history_details();
+        self.clear_history_file_history();
+        self.history_details_visible = false;
+        self.history_focus = HistoryFocusPane::Commits;
         self.clear_pr_status_summary();
         self.invalidate_repo_preview_cache();
         self.repo_preview_refresh_deadline = None;
         self.repo_preview_text = "No unstaged diff output for selected file.".to_string();
+        self.snapshot_inflight = None;
+        self.snapshot_completion_message = None;
+        self.repo_preview_inflight = None;
+        self.repo_preview_pending_key = None;
+        self.history_details_inflight = None;
+        self.stash_details_inflight = None;
+        self.history_entries_inflight = None;
+        self.stash_entries_inflight = None;
+        self.pull_requests_inflight = None;
+        self.pr_status_inflight = None;
+        self.tracking_inflight = None;
+        self.branch_entries_inflight = None;
+        self.remote_branch_entries_inflight = None;
+        self.history_file_history_inflight = None;
+        self.fullscreen_diff_inflight = None;
+        self.fullscreen_diff_pending_key = None;
+        self.close_fullscreen_diff();
+        self.write_inflight = false;
         self.status_message = "Main menu".to_string();
     }
 
@@ -1430,15 +1862,17 @@ impl App {
         let body_option = if body.trim().is_empty() {
             None
         } else {
-            Some(body.as_str())
+            Some(body)
         };
         let root = self.current_repo_root()?.to_path_buf();
-        git::commit(&root, &subject, body_option)?;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
         self.input_cursor = 0;
-        self.refresh()?;
-        self.status_message = "Commit created".to_string();
+        self.request_write_op(
+            "Creating commit",
+            AsyncWriteOp::Commit,
+            move || git::commit(&root, &subject, body_option.as_deref()),
+        );
         Ok(())
     }
 
@@ -1494,18 +1928,11 @@ impl App {
         self.input_cursor = 0;
 
         let root = self.current_repo_root()?.to_path_buf();
-        match git::create_pull_request(&root, &title, &body) {
-            Ok(_) => {
-                if let Err(err) = self.refresh_pull_requests() {
-                    self.status_message = format_gh_error_for_status(&err);
-                    return Ok(());
-                }
-                self.status_message = "Created pull request".to_string();
-            }
-            Err(err) => {
-                self.status_message = format_gh_error_for_status(&err);
-            }
-        }
+        self.request_write_op(
+            "Creating pull request",
+            AsyncWriteOp::CreatePullRequest,
+            move || git::create_pull_request(&root, &title, &body),
+        );
         Ok(())
     }
 
@@ -1584,9 +2011,8 @@ impl App {
     }
 
     fn open_repo_path(&mut self, path: PathBuf) -> Result<()> {
-        let snapshot = git::snapshot(&path)?;
         self.repo_root = Some(path);
-        self.snapshot = snapshot;
+        self.snapshot = RepoSnapshot::default();
         self.refresh_last_fetch_from_git_metadata();
         self.screen = Screen::RepoView;
         self.focus = FocusPane::Unstaged;
@@ -1615,9 +2041,24 @@ impl App {
         self.pending_pr_title = None;
         self.pending_commit_subject = None;
         self.clear_pr_status_summary();
+        self.snapshot_inflight = None;
+        self.snapshot_completion_message = None;
+        self.repo_preview_inflight = None;
+        self.repo_preview_pending_key = None;
+        self.history_details_inflight = None;
+        self.stash_details_inflight = None;
+        self.history_entries_inflight = None;
+        self.stash_entries_inflight = None;
+        self.pull_requests_inflight = None;
+        self.pr_status_inflight = None;
+        self.tracking_inflight = None;
+        self.branch_entries_inflight = None;
+        self.remote_branch_entries_inflight = None;
+        self.write_inflight = false;
         self.invalidate_repo_preview_cache();
         self.schedule_repo_preview_refresh();
-        self.status_message = "Opened repository".to_string();
+        self.request_snapshot_refresh(Some("Opened repository".to_string()))?;
+        self.set_async_running_status("Opening repository");
         Ok(())
     }
 
@@ -1658,11 +2099,8 @@ impl App {
     }
 
     fn refresh_pull_requests(&mut self) -> Result<()> {
-        let root = self.current_repo_root()?.to_path_buf();
         self.clear_pr_status_summary();
-        self.pull_requests = git::pull_requests(&root, self.pr_filter)?;
-        self.selected_pr = min(self.selected_pr, self.pull_requests.len().saturating_sub(1));
-        self.schedule_selected_pr_status_refresh();
+        self.request_pull_requests_refresh()?;
         Ok(())
     }
 
@@ -1706,27 +2144,54 @@ impl App {
             .ok_or_else(|| anyhow!("No repository is currently open"))
     }
 
-    fn current_unstaged(&self) -> Option<&FileEntry> {
-        self.snapshot.unstaged.get(self.selected_unstaged)
+    fn current_unstaged_row(&self) -> Option<&TreeRow> {
+        self.unstaged_tree.row(self.selected_unstaged)
     }
 
-    fn current_staged(&self) -> Option<&FileEntry> {
-        self.snapshot.staged.get(self.selected_staged)
+    fn current_staged_row(&self) -> Option<&TreeRow> {
+        self.staged_tree.row(self.selected_staged)
     }
 
     fn ensure_selection_bounds(&mut self) {
-        if self.snapshot.unstaged.is_empty() {
+        self.rebuild_status_trees();
+        if self.unstaged_tree.len() == 0 {
             self.selected_unstaged = 0;
         } else {
-            self.selected_unstaged = min(self.selected_unstaged, self.snapshot.unstaged.len() - 1);
+            self.selected_unstaged = min(self.selected_unstaged, self.unstaged_tree.len() - 1);
         }
-        if self.snapshot.staged.is_empty() {
+        if self.staged_tree.len() == 0 {
             self.selected_staged = 0;
         } else {
-            self.selected_staged = min(self.selected_staged, self.snapshot.staged.len() - 1);
+            self.selected_staged = min(self.selected_staged, self.staged_tree.len() - 1);
         }
         self.invalidate_repo_preview_cache();
         self.schedule_repo_preview_refresh();
+    }
+
+    fn rebuild_status_trees(&mut self) {
+        self.unstaged_tree.set_files(
+            self.snapshot
+                .unstaged
+                .iter()
+                .map(|entry| FileLeaf {
+                    path: entry.path.clone(),
+                    status: entry.status.clone(),
+                })
+                .collect(),
+        );
+        self.unstaged_tree.expand_all_dirs();
+
+        self.staged_tree.set_files(
+            self.snapshot
+                .staged
+                .iter()
+                .map(|entry| FileLeaf {
+                    path: entry.path.clone(),
+                    status: entry.status.clone(),
+                })
+                .collect(),
+        );
+        self.staged_tree.expand_all_dirs();
     }
 
     fn pull_request_preview_text(&self) -> String {
@@ -1764,23 +2229,7 @@ impl App {
             self.clear_pr_status_summary();
             return;
         };
-        let Some(root) = self.repo_root.as_ref() else {
-            self.clear_pr_status_summary();
-            return;
-        };
-
-        match git::pull_request_status_summary(root, pr.number) {
-            Ok(summary) => {
-                self.pr_status_for = Some(pr.number);
-                self.pr_status_summary = Some(summary);
-            }
-            Err(_) => {
-                self.pr_status_for = Some(pr.number);
-                self.pr_status_summary = None;
-            }
-        }
-        self.pr_status_pending_for = None;
-        self.pr_status_refresh_deadline = None;
+        self.request_pr_status_refresh(pr.number);
     }
 
     fn clear_pr_status_summary(&mut self) {
@@ -1788,6 +2237,7 @@ impl App {
         self.pr_status_summary = None;
         self.pr_status_pending_for = None;
         self.pr_status_refresh_deadline = None;
+        self.pr_status_inflight = None;
     }
 
     fn schedule_selected_pr_status_refresh(&mut self) {
@@ -1821,9 +2271,1082 @@ impl App {
         self.refresh_selected_pr_status_summary();
     }
 
+    fn process_async_events(&mut self) {
+        while let Ok(event) = self.async_rx.try_recv() {
+            match event {
+                AppAsyncEvent::JobState { key, state } => {
+                    self.async_job_lifecycle.insert(key, state);
+                }
+                AppAsyncEvent::JobCancelled { key } => {
+                    self.async_cancelled_jobs = self.async_cancelled_jobs.saturating_add(1);
+                    self.async_job_lifecycle.insert(key, AsyncJobLifecycle::Idle);
+                }
+                AppAsyncEvent::SnapshotReady {
+                    request_id,
+                    snapshot,
+                } => {
+                    if self.snapshot_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.snapshot_inflight = None;
+                    match snapshot {
+                        Ok(snapshot) => {
+                            self.snapshot = snapshot;
+                            self.refresh_last_fetch_from_git_metadata();
+                            self.ensure_selection_bounds();
+                            self.invalidate_repo_preview_cache();
+                            self.schedule_repo_preview_refresh();
+                            if let Some(message) = self.snapshot_completion_message.take() {
+                                self.status_message = message;
+                            }
+                        }
+                        Err(err) => {
+                            self.snapshot_completion_message = None;
+                            self.set_async_error_status("Status refresh", &err);
+                        }
+                    }
+                }
+                AppAsyncEvent::RepoPreviewReady {
+                    request_id,
+                    key,
+                    preview,
+                } => {
+                    if self.repo_preview_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.repo_preview_inflight = None;
+                    self.repo_preview_pending_key = None;
+                    if self.current_repo_preview_key().as_deref() != Some(key.as_str()) {
+                        continue;
+                    }
+                    self.repo_preview_key = Some(key);
+                    self.repo_preview_text = preview;
+                }
+                AppAsyncEvent::HistoryDetailsReady {
+                    request_id,
+                    commit_hash,
+                    short_hash,
+                    details,
+                } => {
+                    if self.history_details_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.history_details_inflight = None;
+                    if self.history_entries.get(self.selected_history).map(|entry| entry.hash.as_str())
+                        != Some(commit_hash.as_str())
+                    {
+                        continue;
+                    }
+                    match details {
+                        Ok(details) => {
+                            self.history_details = Some(details);
+                            self.history_details_for = Some(commit_hash);
+                            self.history_file_tree_selected = 0;
+                            self.clear_history_file_history();
+                            self.expand_all_history_dirs();
+                            self.status_message = format!("Loaded commit details {}", short_hash);
+                        }
+                        Err(err) => {
+                            self.set_async_error_status("Commit details", &err);
+                        }
+                    }
+                }
+                AppAsyncEvent::HistoryFileHistoryReady {
+                    request_id,
+                    commit_hash,
+                    path,
+                    entries,
+                } => {
+                    if self.history_file_history_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.history_file_history_inflight = None;
+                    if self.history_entries.get(self.selected_history).map(|entry| entry.hash.as_str())
+                        != Some(commit_hash.as_str())
+                    {
+                        continue;
+                    }
+                    if self.history_file_history_for_path.as_deref() != Some(path.as_str()) {
+                        continue;
+                    }
+                    match entries {
+                        Ok(entries) => {
+                            self.history_file_history_entries = entries;
+                            self.history_file_history_selected = 0;
+                            self.history_focus = HistoryFocusPane::FileHistory;
+                            self.status_message = format!("Loaded history for {}", path);
+                        }
+                        Err(err) => self.set_async_error_status("File history", &err),
+                    }
+                }
+                AppAsyncEvent::StashDetailsReady {
+                    request_id,
+                    reference,
+                    details,
+                } => {
+                    if self.stash_details_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.stash_details_inflight = None;
+                    if self.stash_entries.get(self.selected_stash).map(|entry| entry.reference.as_str())
+                        != Some(reference.as_str())
+                    {
+                        continue;
+                    }
+                    match details {
+                        Ok(details) => {
+                            self.stash_details = truncate_lines(details, 220);
+                            self.stash_details_for = Some(reference.clone());
+                            self.status_message = format!("Loaded stash details {}", reference);
+                        }
+                        Err(err) => {
+                            self.set_async_error_status("Stash details", &err);
+                        }
+                    }
+                }
+                AppAsyncEvent::HistoryEntriesReady { request_id, entries } => {
+                    if self.history_entries_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.history_entries_inflight = None;
+                    match entries {
+                        Ok(entries) => {
+                            self.history_entries = entries;
+                            self.selected_history = min(
+                                self.selected_history,
+                                self.history_entries.len().saturating_sub(1),
+                            );
+                            self.clear_history_details();
+                            if self.history_details_visible {
+                                let _ = self.load_selected_commit_details();
+                            }
+                        }
+                        Err(err) => {
+                            self.set_async_error_status("History refresh", &err);
+                        }
+                    }
+                }
+                AppAsyncEvent::StashEntriesReady { request_id, entries } => {
+                    if self.stash_entries_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.stash_entries_inflight = None;
+                    match entries {
+                        Ok(entries) => {
+                            self.stash_entries = entries;
+                            self.selected_stash = min(
+                                self.selected_stash,
+                                self.stash_entries.len().saturating_sub(1),
+                            );
+                            self.clear_stash_details();
+                        }
+                        Err(err) => {
+                            self.set_async_error_status("Stash refresh", &err);
+                        }
+                    }
+                }
+                AppAsyncEvent::PullRequestsReady {
+                    request_id,
+                    filter,
+                    entries,
+                } => {
+                    if self.pull_requests_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.pull_requests_inflight = None;
+                    if self.pr_filter != filter {
+                        continue;
+                    }
+                    match entries {
+                        Ok(entries) => {
+                            self.clear_pr_status_summary();
+                            self.pull_requests = entries;
+                            self.selected_pr = min(
+                                self.selected_pr,
+                                self.pull_requests.len().saturating_sub(1),
+                            );
+                            self.schedule_selected_pr_status_refresh();
+                        }
+                        Err(err) => {
+                            self.status_message = format_gh_error_for_status(&anyhow!(err));
+                        }
+                    }
+                }
+                AppAsyncEvent::PullRequestStatusReady {
+                    request_id,
+                    pr_number,
+                    summary,
+                } => {
+                    if self.pr_status_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.pr_status_inflight = None;
+                    if self.pull_requests.get(self.selected_pr).map(|pr| pr.number)
+                        != Some(pr_number)
+                    {
+                        continue;
+                    }
+                    self.pr_status_for = Some(pr_number);
+                    self.pr_status_summary = summary.ok();
+                    self.pr_status_pending_for = None;
+                    self.pr_status_refresh_deadline = None;
+                }
+                AppAsyncEvent::TrackingSummaryReady { request_id, summary } => {
+                    if self.tracking_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.tracking_inflight = None;
+                    match summary {
+                        Ok(summary) => self.tracking_summary = Some(summary),
+                        Err(err) => {
+                            self.tracking_summary = None;
+                            self.set_async_error_status("Tracking refresh", &err);
+                        }
+                    }
+                }
+                AppAsyncEvent::BranchEntriesReady { request_id, entries } => {
+                    if self.branch_entries_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.branch_entries_inflight = None;
+                    match entries {
+                        Ok(entries) => {
+                            self.branch_entries = entries;
+                            self.selected_branch = self
+                                .branch_entries
+                                .iter()
+                                .position(|entry| entry.is_current)
+                                .unwrap_or(0);
+                        }
+                        Err(err) => self.set_async_error_status("Branch refresh", &err),
+                    }
+                }
+                AppAsyncEvent::RemoteBranchEntriesReady { request_id, entries } => {
+                    if self.remote_branch_entries_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.remote_branch_entries_inflight = None;
+                    match entries {
+                        Ok(entries) => {
+                            self.remote_branch_entries = entries;
+                            self.selected_remote_branch = min(
+                                self.selected_remote_branch,
+                                self.remote_branch_entries.len().saturating_sub(1),
+                            );
+                        }
+                        Err(err) => self.set_async_error_status("Remote branch refresh", &err),
+                    }
+                }
+                AppAsyncEvent::FullscreenDiffReady {
+                    request_id,
+                    key,
+                    title,
+                    diff,
+                } => {
+                    if self.fullscreen_diff_inflight != Some(request_id) {
+                        continue;
+                    }
+                    self.fullscreen_diff_inflight = None;
+                    self.fullscreen_diff_pending_key = None;
+                    if self.fullscreen_diff.as_ref().map(|state| state.key.as_str()) != Some(key.as_str()) {
+                        continue;
+                    }
+                    match diff {
+                        Ok(diff) => {
+                            self.set_fullscreen_diff_content(&title, &key, &diff);
+                            self.status_message = format!("Opened diff viewer: {}", title);
+                        }
+                        Err(err) => {
+                            self.set_fullscreen_diff_content(
+                                &title,
+                                &key,
+                                &format!("Unable to load diff:\n{err}"),
+                            );
+                            self.set_async_error_status("Diff viewer", &err);
+                        }
+                    }
+                }
+                AppAsyncEvent::WriteOpFinished { op, result } => {
+                    self.write_inflight = false;
+                    match (op, result) {
+                        (AsyncWriteOp::StageFile { path }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!("Staged {}", path)));
+                        }
+                        (AsyncWriteOp::UnstageFile { path }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!("Unstaged {}", path)));
+                        }
+                        (AsyncWriteOp::StageAll { total }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Staged all unstaged files ({total})"
+                            )));
+                        }
+                        (AsyncWriteOp::UnstageAll { total }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Unstaged all staged files ({total})"
+                            )));
+                        }
+                        (AsyncWriteOp::Fetch, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some("Fetched remotes".to_string()));
+                            if self.screen == Screen::TrackingStatusView {
+                                let _ = self.refresh_tracking_status_summary();
+                            }
+                        }
+                        (AsyncWriteOp::Pull, Ok(())) => {
+                            let _ =
+                                self.request_snapshot_refresh(Some("Pulled latest changes".to_string()));
+                            if self.screen == Screen::TrackingStatusView {
+                                let _ = self.refresh_tracking_status_summary();
+                            }
+                        }
+                        (AsyncWriteOp::Push, Ok(())) => {
+                            let _ =
+                                self.request_snapshot_refresh(Some("Pushed current branch".to_string()));
+                            if self.screen == Screen::TrackingStatusView {
+                                let _ = self.refresh_tracking_status_summary();
+                            }
+                        }
+                        (AsyncWriteOp::CherryPickContinue, Ok(())) => {
+                            let _ = self
+                                .request_snapshot_refresh(Some("Cherry-pick continued".to_string()));
+                        }
+                        (AsyncWriteOp::CherryPickAbort, Ok(())) => {
+                            let _ =
+                                self.request_snapshot_refresh(Some("Cherry-pick aborted".to_string()));
+                        }
+                        (
+                            AsyncWriteOp::DiscardFile {
+                                path,
+                                is_untracked,
+                            },
+                            Ok(()),
+                        ) => {
+                            let message = if is_untracked {
+                                format!("Removed untracked {}", path)
+                            } else {
+                                format!("Discarded unstaged changes in {}", path)
+                            };
+                            let _ = self.request_snapshot_refresh(Some(message));
+                        }
+                        (AsyncWriteOp::SwitchBranch { branch_name }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Switched to branch {}",
+                                branch_name
+                            )));
+                            let _ = self.refresh_branch_entries();
+                            self.return_to_repo_view();
+                        }
+                        (AsyncWriteOp::CheckoutRemoteBranch { branch_name }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Checked out remote branch {}",
+                                branch_name
+                            )));
+                            let _ = self.refresh_remote_branch_entries();
+                            self.return_to_repo_view();
+                        }
+                        (AsyncWriteOp::CreateBranch { branch_name }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Created and switched to branch {}",
+                                branch_name
+                            )));
+                            let _ = self.refresh_branch_entries();
+                            self.return_to_repo_view();
+                        }
+                        (AsyncWriteOp::CheckoutPullRequest { number }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Checked out PR #{}",
+                                number
+                            )));
+                        }
+                        (AsyncWriteOp::MergePullRequest { number, method }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Merged PR #{} with {}",
+                                number,
+                                pull_request_merge_method_label(method)
+                            )));
+                            let _ = self.refresh_pull_requests();
+                        }
+                        (AsyncWriteOp::CreatePullRequest, Ok(())) => {
+                            let _ = self.refresh_pull_requests();
+                            self.status_message = "Created pull request".to_string();
+                        }
+                        (AsyncWriteOp::Commit, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some("Commit created".to_string()));
+                        }
+                        (AsyncWriteOp::StashPush, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some("Stashed current changes".to_string()));
+                            let _ = self.refresh_stash_entries();
+                            self.clear_stash_details();
+                        }
+                        (AsyncWriteOp::StashApply { reference }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!("Applied {}", reference)));
+                        }
+                        (AsyncWriteOp::StashPop { reference }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!("Popped {}", reference)));
+                            let _ = self.refresh_stash_entries();
+                            self.clear_stash_details();
+                        }
+                        (AsyncWriteOp::StashDrop { reference }, Ok(())) => {
+                            let _ = self.refresh_stash_entries();
+                            self.clear_stash_details();
+                            self.status_message = format!("Dropped {}", reference);
+                        }
+                        (AsyncWriteOp::CheckoutDetached { short_hash }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Checked out {} (detached HEAD)",
+                                short_hash
+                            )));
+                            self.clear_history_details();
+                        }
+                        (AsyncWriteOp::CherryPickCommit { short_hash }, Ok(())) => {
+                            let _ = self.request_snapshot_refresh(Some(format!(
+                                "Cherry-picked {}",
+                                short_hash
+                            )));
+                            let _ = self.refresh_history_entries();
+                        }
+                        (AsyncWriteOp::OpenPrInBrowser { number }, Ok(())) => {
+                            self.status_message = format!("Opened PR #{} in browser", number);
+                        }
+                        (AsyncWriteOp::StageFile { .. }, Err(err))
+                        | (AsyncWriteOp::UnstageFile { .. }, Err(err))
+                        | (AsyncWriteOp::StageAll { .. }, Err(err))
+                        | (AsyncWriteOp::UnstageAll { .. }, Err(err))
+                        | (AsyncWriteOp::Fetch, Err(err))
+                        | (AsyncWriteOp::Pull, Err(err))
+                        | (AsyncWriteOp::Push, Err(err))
+                        | (AsyncWriteOp::CherryPickContinue, Err(err))
+                        | (AsyncWriteOp::CherryPickAbort, Err(err))
+                        | (AsyncWriteOp::DiscardFile { .. }, Err(err))
+                        | (AsyncWriteOp::SwitchBranch { .. }, Err(err))
+                        | (AsyncWriteOp::CheckoutRemoteBranch { .. }, Err(err))
+                        | (AsyncWriteOp::CreateBranch { .. }, Err(err))
+                        | (AsyncWriteOp::Commit, Err(err))
+                        | (AsyncWriteOp::StashPush, Err(err))
+                        | (AsyncWriteOp::StashApply { .. }, Err(err))
+                        | (AsyncWriteOp::StashPop { .. }, Err(err))
+                        | (AsyncWriteOp::StashDrop { .. }, Err(err))
+                        | (AsyncWriteOp::CheckoutDetached { .. }, Err(err))
+                        | (AsyncWriteOp::CherryPickCommit { .. }, Err(err)) => {
+                            self.status_message = format!("Action failed: {err}");
+                        }
+                        (AsyncWriteOp::OpenPrInBrowser { .. }, Err(err)) => {
+                            self.status_message = format_gh_error_for_status(&anyhow!(err));
+                        }
+                        (AsyncWriteOp::CheckoutPullRequest { .. }, Err(err))
+                        | (AsyncWriteOp::MergePullRequest { .. }, Err(err))
+                        | (AsyncWriteOp::CreatePullRequest, Err(err)) => {
+                            self.status_message = format_gh_error_for_status(&anyhow!(err));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn set_async_running_status(&mut self, label: &str) {
+        self.status_message = format!("{label}...");
+    }
+
+    fn set_async_error_status(&mut self, label: &str, err: &str) {
+        self.last_async_error = Some(err.to_string());
+        self.status_message = format!("{label} failed: {err}");
+    }
+
+    fn queue_async_task<F>(&mut self, key: &'static str, job: F) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.async_job_lifecycle.insert(key, AsyncJobLifecycle::Queued);
+        let tx = self.async_tx.clone();
+        self.async_scheduler
+            .submit(move || {
+                let _ = tx.send(AppAsyncEvent::JobState {
+                    key,
+                    state: AsyncJobLifecycle::Running,
+                });
+                job();
+                let _ = tx.send(AppAsyncEvent::JobState {
+                    key,
+                    state: AsyncJobLifecycle::Idle,
+                });
+            })
+            .map_err(|err| {
+                self.async_job_lifecycle.insert(key, AsyncJobLifecycle::Idle);
+                self.async_dispatch_failures = self.async_dispatch_failures.saturating_add(1);
+                self.last_async_error = Some(err.clone());
+                anyhow!(err)
+            })
+    }
+
+    fn queue_cancellable_async_task<F>(
+        &mut self,
+        key: &'static str,
+        token: u64,
+        job: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.async_job_lifecycle.insert(key, AsyncJobLifecycle::Queued);
+        let tx = self.async_tx.clone();
+        let tx_cancel = self.async_tx.clone();
+        self.async_scheduler
+            .submit_cancellable(
+                key,
+                token,
+                move || {
+                    let _ = tx_cancel.send(AppAsyncEvent::JobCancelled { key });
+                    let _ = tx_cancel.send(AppAsyncEvent::JobState {
+                        key,
+                        state: AsyncJobLifecycle::Idle,
+                    });
+                },
+                move || {
+                    let _ = tx.send(AppAsyncEvent::JobState {
+                        key,
+                        state: AsyncJobLifecycle::Running,
+                    });
+                    job();
+                    let _ = tx.send(AppAsyncEvent::JobState {
+                        key,
+                        state: AsyncJobLifecycle::Idle,
+                    });
+                },
+            )
+            .map_err(|err| {
+                self.async_job_lifecycle.insert(key, AsyncJobLifecycle::Idle);
+                self.async_dispatch_failures = self.async_dispatch_failures.saturating_add(1);
+                self.last_async_error = Some(err.clone());
+                anyhow!(err)
+            })
+    }
+
+    fn request_write_op<F>(&mut self, running_label: &str, op: AsyncWriteOp, job: F)
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        if self.write_inflight {
+            self.status_message = "Another action is still running".to_string();
+            return;
+        }
+        self.write_inflight = true;
+        self.set_async_running_status(running_label);
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_async_task(JOB_WRITE, move || {
+            let result = job().map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::WriteOpFinished { op, result });
+        }) {
+            self.write_inflight = false;
+            self.status_message = format!("Unable to queue action: {err}");
+        }
+    }
+
+    fn request_snapshot_refresh(&mut self, completion_message: Option<String>) -> Result<()> {
+        let root = self.current_repo_root()?.to_path_buf();
+        self.snapshot_request_seq = self.snapshot_request_seq.saturating_add(1);
+        let request_id = self.snapshot_request_seq;
+        self.snapshot_inflight = Some(request_id);
+        self.snapshot_completion_message = completion_message;
+
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_SNAPSHOT, request_id, move || {
+            let snapshot = git::snapshot(&root).map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::SnapshotReady {
+                request_id,
+                snapshot,
+            });
+        }) {
+            self.snapshot_inflight = None;
+            self.snapshot_completion_message = None;
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    fn request_pull_requests_refresh(&mut self) -> Result<()> {
+        let root = self.current_repo_root()?.to_path_buf();
+        let filter = self.pr_filter;
+        self.pull_requests_request_seq = self.pull_requests_request_seq.saturating_add(1);
+        let request_id = self.pull_requests_request_seq;
+        self.pull_requests_inflight = Some(request_id);
+        let tx = self.async_tx.clone();
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_PULL_REQUESTS, request_id, move || {
+                let entries = git::pull_requests(&root, filter).map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::PullRequestsReady {
+                    request_id,
+                    filter,
+                    entries,
+                });
+            })
+        {
+            self.pull_requests_inflight = None;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn request_pr_status_refresh(&mut self, pr_number: u64) {
+        let Some(root) = self.repo_root.clone() else {
+            return;
+        };
+        self.pr_status_request_seq = self.pr_status_request_seq.saturating_add(1);
+        let request_id = self.pr_status_request_seq;
+        self.pr_status_inflight = Some(request_id);
+        let tx = self.async_tx.clone();
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_PR_STATUS, request_id, move || {
+                let summary = git::pull_request_status_summary(&root, pr_number)
+                    .map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::PullRequestStatusReady {
+                    request_id,
+                    pr_number,
+                    summary,
+                });
+            })
+        {
+            self.pr_status_inflight = None;
+            self.set_async_error_status("PR status refresh", &err.to_string());
+        }
+    }
+
+    fn request_tracking_summary_refresh(&mut self) -> Result<()> {
+        let root = self.current_repo_root()?.to_path_buf();
+        self.tracking_request_seq = self.tracking_request_seq.saturating_add(1);
+        let request_id = self.tracking_request_seq;
+        self.tracking_inflight = Some(request_id);
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_TRACKING, request_id, move || {
+            let summary = git::tracking_commit_summary(&root, 30).map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::TrackingSummaryReady { request_id, summary });
+        }) {
+            self.tracking_inflight = None;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn request_branch_entries_refresh(&mut self) -> Result<()> {
+        let root = self.current_repo_root()?.to_path_buf();
+        self.branch_entries_request_seq = self.branch_entries_request_seq.saturating_add(1);
+        let request_id = self.branch_entries_request_seq;
+        self.branch_entries_inflight = Some(request_id);
+        let tx = self.async_tx.clone();
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_BRANCH_ENTRIES, request_id, move || {
+                let entries = git::list_local_branches(&root).map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::BranchEntriesReady { request_id, entries });
+            })
+        {
+            self.branch_entries_inflight = None;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn request_remote_branch_entries_refresh(&mut self) -> Result<()> {
+        let root = self.current_repo_root()?.to_path_buf();
+        self.remote_branch_entries_request_seq =
+            self.remote_branch_entries_request_seq.saturating_add(1);
+        let request_id = self.remote_branch_entries_request_seq;
+        self.remote_branch_entries_inflight = Some(request_id);
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(
+            JOB_REMOTE_BRANCH_ENTRIES,
+            request_id,
+            move || {
+                let entries = git::list_remote_branches(&root).map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::RemoteBranchEntriesReady { request_id, entries });
+            },
+        ) {
+            self.remote_branch_entries_inflight = None;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    pub fn is_fullscreen_diff_visible(&self) -> bool {
+        self.fullscreen_diff.is_some()
+    }
+
+    pub fn fullscreen_diff_title(&self) -> Option<&str> {
+        self.fullscreen_diff.as_ref().map(|state| state.title.as_str())
+    }
+
+    pub fn fullscreen_diff_scroll_position(&self) -> Option<(usize, usize)> {
+        self.fullscreen_diff
+            .as_ref()
+            .map(|state| (state.scroll_y, state.scroll_x))
+    }
+
+    pub fn fullscreen_diff_visible_lines(&self, width: usize, height: usize) -> Vec<String> {
+        let Some(state) = self.fullscreen_diff.as_ref() else {
+            return Vec::new();
+        };
+        if state.loading {
+            return vec!["Loading diff...".to_string()];
+        }
+        let body_width = width.max(1);
+        state
+            .lines
+            .iter()
+            .skip(state.scroll_y)
+            .take(height.max(1))
+            .map(|line| {
+                let chars = line.chars().collect::<Vec<_>>();
+                let start = state.scroll_x.min(chars.len());
+                chars
+                    .iter()
+                    .skip(start)
+                    .take(body_width)
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    pub fn close_fullscreen_diff(&mut self) {
+        self.fullscreen_diff = None;
+        self.fullscreen_diff_inflight = None;
+        self.fullscreen_diff_pending_key = None;
+    }
+
+    pub fn open_status_fullscreen_diff(&mut self) -> Result<()> {
+        if self.screen != Screen::RepoView {
+            return Ok(());
+        }
+        let Some(root) = self.repo_root.clone() else {
+            return Ok(());
+        };
+        let (path, staged) = match self.focus {
+            FocusPane::Unstaged => {
+                let row = self
+                    .current_unstaged_row()
+                    .ok_or_else(|| anyhow!("No unstaged path selected"))?;
+                if row.kind != TreeRowKind::File {
+                    self.status_message = "Select a file to open diff preview".to_string();
+                    return Ok(());
+                }
+                (row.path.clone(), false)
+            }
+            FocusPane::Staged => {
+                let row = self
+                    .current_staged_row()
+                    .ok_or_else(|| anyhow!("No staged path selected"))?;
+                if row.kind != TreeRowKind::File {
+                    self.status_message = "Select a file to open diff preview".to_string();
+                    return Ok(());
+                }
+                (row.path.clone(), true)
+            }
+        };
+        let title = if staged {
+            format!("Staged Diff: {path}")
+        } else {
+            format!("Unstaged Diff: {path}")
+        };
+        let key = format!("status:{}:{path}", if staged { "staged" } else { "unstaged" });
+        self.request_fullscreen_diff(title, key, move || git::diff_for_file(&root, &path, staged))?;
+        Ok(())
+    }
+
+    pub fn status_tree_focus_right(&mut self) -> Result<()> {
+        if self.screen != Screen::RepoView {
+            return Ok(());
+        }
+        let expanded = match self.focus {
+            FocusPane::Unstaged => self.unstaged_tree.expand_selected_dir(self.selected_unstaged),
+            FocusPane::Staged => self.staged_tree.expand_selected_dir(self.selected_staged),
+        };
+        if expanded {
+            self.status_message = "Expanded folder".to_string();
+            return Ok(());
+        }
+        self.open_status_fullscreen_diff()
+    }
+
+    pub fn status_tree_focus_left(&mut self) {
+        if self.screen != Screen::RepoView {
+            return;
+        }
+        let collapsed = match self.focus {
+            FocusPane::Unstaged => {
+                let selected_path = self
+                    .unstaged_tree
+                    .row_path(self.selected_unstaged)
+                    .map(|path| path.to_string());
+                let collapsed = self.unstaged_tree.collapse_selected_dir(self.selected_unstaged);
+                if collapsed {
+                    if let Some(path) = selected_path {
+                        if let Some(new_idx) = self.unstaged_tree.find_row_index_by_path(&path) {
+                            self.selected_unstaged = new_idx;
+                        }
+                    }
+                }
+                collapsed
+            }
+            FocusPane::Staged => {
+                let selected_path = self
+                    .staged_tree
+                    .row_path(self.selected_staged)
+                    .map(|path| path.to_string());
+                let collapsed = self.staged_tree.collapse_selected_dir(self.selected_staged);
+                if collapsed {
+                    if let Some(path) = selected_path {
+                        if let Some(new_idx) = self.staged_tree.find_row_index_by_path(&path) {
+                            self.selected_staged = new_idx;
+                        }
+                    }
+                }
+                collapsed
+            }
+        };
+        if collapsed {
+            self.status_message = "Collapsed folder".to_string();
+        }
+    }
+
+    pub fn unstaged_tree_rows(&self) -> &[TreeRow] {
+        self.unstaged_tree.rows()
+    }
+
+    pub fn staged_tree_rows(&self) -> &[TreeRow] {
+        self.staged_tree.rows()
+    }
+
+    pub fn fullscreen_diff_move_down(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        if state.lines.is_empty() {
+            return;
+        }
+        state.scroll_y = min(state.scroll_y.saturating_add(1), state.lines.len().saturating_sub(1));
+    }
+
+    pub fn fullscreen_diff_move_up(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_y = state.scroll_y.saturating_sub(1);
+        }
+    }
+
+    pub fn fullscreen_diff_page_down(&mut self, page_height: usize) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        if state.lines.is_empty() {
+            return;
+        }
+        state.scroll_y = min(
+            state.scroll_y.saturating_add(page_height.max(1)),
+            state.lines.len().saturating_sub(1),
+        );
+    }
+
+    pub fn fullscreen_diff_page_up(&mut self, page_height: usize) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_y = state.scroll_y.saturating_sub(page_height.max(1));
+        }
+    }
+
+    pub fn fullscreen_diff_home(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_y = 0;
+        }
+    }
+
+    pub fn fullscreen_diff_end(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        if !state.lines.is_empty() {
+            state.scroll_y = state.lines.len().saturating_sub(1);
+        }
+    }
+
+    pub fn fullscreen_diff_scroll_left(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_x = state.scroll_x.saturating_sub(4);
+        }
+    }
+
+    pub fn fullscreen_diff_scroll_right(&mut self) {
+        if let Some(state) = self.fullscreen_diff.as_mut() {
+            state.scroll_x = state.scroll_x.saturating_add(4);
+        }
+    }
+
+    pub fn fullscreen_diff_next_hunk(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        let target = state
+            .hunk_lines
+            .iter()
+            .copied()
+            .find(|line| *line > state.scroll_y);
+        if let Some(target) = target {
+            state.scroll_y = target;
+        }
+    }
+
+    pub fn fullscreen_diff_prev_hunk(&mut self) {
+        let Some(state) = self.fullscreen_diff.as_mut() else {
+            return;
+        };
+        let target = state
+            .hunk_lines
+            .iter()
+            .copied()
+            .rev()
+            .find(|line| *line < state.scroll_y);
+        if let Some(target) = target {
+            state.scroll_y = target;
+        }
+    }
+
+    fn request_fullscreen_diff<F>(&mut self, title: String, key: String, load: F) -> Result<()>
+    where
+        F: FnOnce() -> Result<String> + Send + 'static,
+    {
+        self.fullscreen_diff = Some(FullscreenDiffState {
+            key: key.clone(),
+            title: title.clone(),
+            lines: vec!["Loading diff...".to_string()],
+            hunk_lines: Vec::new(),
+            scroll_y: 0,
+            scroll_x: 0,
+            loading: true,
+        });
+        self.fullscreen_diff_request_seq = self.fullscreen_diff_request_seq.saturating_add(1);
+        let request_id = self.fullscreen_diff_request_seq;
+        self.fullscreen_diff_inflight = Some(request_id);
+        self.fullscreen_diff_pending_key = Some(key.clone());
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_FULLSCREEN_DIFF, request_id, move || {
+            let diff = load().map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::FullscreenDiffReady {
+                request_id,
+                key,
+                title,
+                diff,
+            });
+        }) {
+            self.fullscreen_diff_inflight = None;
+            self.fullscreen_diff_pending_key = None;
+            self.close_fullscreen_diff();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn set_fullscreen_diff_content(&mut self, title: &str, key: &str, diff: &str) {
+        let lines = if diff.is_empty() {
+            vec!["(No diff output)".to_string()]
+        } else {
+            diff.lines().map(|line| line.to_string()).collect::<Vec<_>>()
+        };
+        let hunk_lines = lines
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, line)| line.starts_with("@@").then_some(idx))
+            .collect::<Vec<_>>();
+        self.fullscreen_diff = Some(FullscreenDiffState {
+            key: key.to_string(),
+            title: title.to_string(),
+            lines,
+            hunk_lines,
+            scroll_y: 0,
+            scroll_x: 0,
+            loading: false,
+        });
+    }
+
+    fn request_repo_preview_refresh(&mut self) {
+        if self.screen != Screen::RepoView {
+            return;
+        }
+        let key = self.current_repo_preview_key();
+        if self.repo_preview_key == key {
+            return;
+        }
+        let Some(key) = key else {
+            self.repo_preview_key = None;
+            self.repo_preview_text = self.empty_repo_preview_text();
+            self.repo_preview_inflight = None;
+            self.repo_preview_pending_key = None;
+            return;
+        };
+
+        if self.repo_preview_pending_key.as_deref() == Some(key.as_str())
+            && self.repo_preview_inflight.is_some()
+        {
+            return;
+        }
+
+        let Some(root) = self.repo_root.clone() else {
+            self.repo_preview_text = self.empty_repo_preview_text();
+            return;
+        };
+
+        let (path, staged, empty_text) = match self.focus {
+            FocusPane::Unstaged => self.current_unstaged_row().map_or_else(
+                || (String::new(), false, self.empty_repo_preview_text()),
+                |row| {
+                    if row.kind == TreeRowKind::File {
+                        (row.path.clone(), false, self.empty_repo_preview_text())
+                    } else {
+                        (String::new(), false, "Select a file to preview diff.".to_string())
+                    }
+                },
+            ),
+            FocusPane::Staged => self.current_staged_row().map_or_else(
+                || (String::new(), true, self.empty_repo_preview_text()),
+                |row| {
+                    if row.kind == TreeRowKind::File {
+                        (row.path.clone(), true, self.empty_repo_preview_text())
+                    } else {
+                        (String::new(), true, "Select a file to preview diff.".to_string())
+                    }
+                },
+            ),
+        };
+        if path.is_empty() {
+            self.repo_preview_key = None;
+            self.repo_preview_text = empty_text;
+            return;
+        }
+
+        self.repo_preview_request_seq = self.repo_preview_request_seq.saturating_add(1);
+        let request_id = self.repo_preview_request_seq;
+        self.repo_preview_inflight = Some(request_id);
+        self.repo_preview_pending_key = Some(key.clone());
+        self.repo_preview_text = "Loading preview...".to_string();
+
+        let tx = self.async_tx.clone();
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_REPO_PREVIEW, request_id, move || {
+                let preview = git::diff_for_file(&root, &path, staged)
+                    .map(|diff| truncate_lines(diff, 90))
+                    .unwrap_or(empty_text);
+                let _ = tx.send(AppAsyncEvent::RepoPreviewReady {
+                    request_id,
+                    key,
+                    preview,
+                });
+            })
+        {
+            self.repo_preview_inflight = None;
+            self.repo_preview_pending_key = None;
+            self.set_async_error_status("Preview refresh", &err.to_string());
+        }
+    }
+
     fn schedule_repo_preview_refresh(&mut self) {
         if self.screen != Screen::RepoView {
             self.repo_preview_refresh_deadline = None;
+            self.repo_preview_inflight = None;
+            self.repo_preview_pending_key = None;
             return;
         }
         let key = self.current_repo_preview_key();
@@ -1835,6 +3358,8 @@ impl App {
         if key.is_none() {
             self.repo_preview_text = self.empty_repo_preview_text();
             self.repo_preview_refresh_deadline = None;
+            self.repo_preview_inflight = None;
+            self.repo_preview_pending_key = None;
             return;
         }
 
@@ -1853,67 +3378,27 @@ impl App {
             return;
         }
         self.repo_preview_refresh_deadline = None;
-        self.refresh_repo_preview_cache();
-    }
-
-    fn refresh_repo_preview_cache(&mut self) {
-        if self.screen != Screen::RepoView {
-            return;
-        }
-        let key = self.current_repo_preview_key();
-
-        if self.repo_preview_key == key {
-            return;
-        }
-
-        if key.is_none() {
-            self.repo_preview_text = self.empty_repo_preview_text();
-            self.repo_preview_key = None;
-            return;
-        }
-
-        let preview = match self.focus {
-            FocusPane::Unstaged => self
-                .current_unstaged()
-                .and_then(|file| {
-                    self.current_repo_root()
-                        .ok()
-                        .and_then(|root| git::diff_for_file(root, &file.path, false).ok())
-                })
-                .map_or_else(
-                    || "No unstaged diff output for selected file.".to_string(),
-                    |d| truncate_lines(d, 90),
-                ),
-            FocusPane::Staged => self
-                .current_staged()
-                .and_then(|file| {
-                    self.current_repo_root()
-                        .ok()
-                        .and_then(|root| git::diff_for_file(root, &file.path, true).ok())
-                })
-                .map_or_else(
-                    || "No staged diff output for selected file.".to_string(),
-                    |d| truncate_lines(d, 90),
-                ),
-        };
-
-        self.repo_preview_key = key;
-        self.repo_preview_text = preview;
+        self.request_repo_preview_refresh();
     }
 
     fn invalidate_repo_preview_cache(&mut self) {
         self.repo_preview_key = None;
+        self.repo_preview_inflight = None;
+        self.repo_preview_pending_key = None;
     }
 
     fn current_repo_preview_key(&self) -> Option<String> {
         match self.focus {
-            FocusPane::Unstaged => self.current_unstaged().map(|entry| format!(
-                "unstaged:{}:{}",
-                self.selected_unstaged, entry.path
-            )),
+            FocusPane::Unstaged => self.current_unstaged_row().and_then(|row| {
+                (row.kind == TreeRowKind::File)
+                    .then_some(format!("unstaged:{}:{}", self.selected_unstaged, row.path))
+            }),
             FocusPane::Staged => self
-                .current_staged()
-                .map(|entry| format!("staged:{}:{}", self.selected_staged, entry.path)),
+                .current_staged_row()
+                .and_then(|row| {
+                    (row.kind == TreeRowKind::File)
+                        .then_some(format!("staged:{}:{}", self.selected_staged, row.path))
+                }),
         }
     }
 
@@ -1979,6 +3464,7 @@ impl App {
     fn clear_stash_details(&mut self) {
         self.stash_details.clear();
         self.stash_details_for = None;
+        self.stash_details_inflight = None;
     }
 
     fn refresh_last_fetch_from_git_metadata(&mut self) {

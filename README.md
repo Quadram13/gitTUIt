@@ -1,18 +1,22 @@
 # gitTUIt
 
-gitTUIt is a terminal UI for Git/Github workflows.
+gitTUIt is a terminal UI for Git/Github workflows. I am currently using this for personal projects, as well as work tasks under specific conditions. The TUI works in it's current state for my purposes, but is still under development and may experience large/breaking changes, so use this at your own risk.
 
 ## Current Features
 
 - explicit repo tracking(requires local storage)
 - stage/unstage/commit changes (subject + optional multiline body)
-- diff preview for selected file
-- history view with commit details, checkout (detached), and cherry-pick
+- diff and history views for files
+    - uses simple file tree implementation(influenced by gitui's filetreelist crate)
 - incoming/outgoing commit comparison against upstream tracking branch
 - stash manager (stash/apply/pop/drop with preview)
 - GitHub pull request view (list/filter/open/checkout via Github CLI)
-- responsiveness optimizations and context-grouped commands
-    - these changes were influenced by how gitUI handles UI/UX(which I am admittedly not great at)
+- async architecture
+    - async git/gh execution for status, history, stash, branch, tracking, and PR workflows
+    - bounded scheduler (fixed worker pool + bounded queue), request-id stale-result protection, and cancellable queued refreshes
+    - heavily influenced by `gitui`/`asyncgit`, but implemented differently:
+        - this TUI uses an app-level event model + custom scheduler tuned for git + GitHub CLI flows
+        - `gitui` primarily uses `asyncgit` primitives and a different internal async/runtime integration
 
 ## Motivation/Inspiration
 
@@ -35,23 +39,20 @@ A concrete list of upcoming changes(in order):
 
     - other ideas for plugins will be added here as they come up
 
+* async architecture(remaining):
+    - current async implementation uses github as the source for the asyncgit crate, because using the crate from crates.io leads to a git2 version mismatch
+        * should probably fix this in the future 
+    - surface async lifecycle telemetry in UI/log output (queue depth, running jobs, cancellation/failure counters)
+    - make repository browser/directory scanning and heavier file-system work fully non-blocking
+    - add broader tests for async race handling/cancellation semantics under rapid selection/view changes
+    - evolve lifecycle model from queued/running/idle to include explicit success/error/cancelled states in one unified job registry
+
 * customization(themes, colors, syntax highlighting, keybinds)
 
 These are changes/things I note that may not slot cleanly into the list:
 
 - not sure if this app/repo contains/interacts with any sensitive info
     * should probably do a check for any security concerns
-
-- async architecture (remaining work):
-    * move git/gh commands off the UI thread with background workers/tasks
-    * add job lifecycle states (queued/running/success/error) and safe result handoff to UI
-    * support cancel/debounce for long-running or high-frequency jobs (diff/pr/status/history)
-    * make directory scanning and heavy file IO non-blocking
-    * add loading/progress indicators tied to background tasks (beyond current UI-thread placeholders)
-    - current non-async responsiveness constraints:
-        * status diff preview refresh is debounced and lazily loaded after short idle instead of per-keypress execution
-        * status diff preview shows a temporary loading placeholder while deferred refresh is pending
-        * default preview/history windows are intentionally smaller (diff preview truncation and history list size) for faster interaction
 
 - repo setup for contribution
     * proper license(probably MIT?)

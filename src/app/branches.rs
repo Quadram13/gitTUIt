@@ -1,5 +1,3 @@
-use std::cmp::min;
-
 use anyhow::Result;
 
 use crate::git;
@@ -14,7 +12,7 @@ impl App {
         }
         self.screen = Screen::BranchPicker;
         self.refresh_branch_entries()?;
-        self.status_message = "Branch picker: [Enter] switch, [n] new branch".to_string();
+        self.set_async_running_status("Refreshing local branches");
         Ok(())
     }
 
@@ -25,7 +23,7 @@ impl App {
         }
         self.screen = Screen::RemoteBranchPicker;
         self.refresh_remote_branch_entries()?;
-        self.status_message = "Remote branches: [Enter] checkout tracking branch".to_string();
+        self.set_async_running_status("Refreshing remote branches");
         Ok(())
     }
 
@@ -54,11 +52,13 @@ impl App {
 
         let branch_name = entry.name.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        git::switch_branch(&root, &branch_name)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.refresh_branch_entries()?;
-        self.return_to_repo_view();
-        self.status_message = format!("Switched to branch {}", branch_name);
+        self.request_write_op(
+            &format!("Switching to branch {}", branch_name),
+            super::AsyncWriteOp::SwitchBranch {
+                branch_name: branch_name.clone(),
+            },
+            move || git::switch_branch(&root, &branch_name),
+        );
         Ok(())
     }
 
@@ -69,11 +69,13 @@ impl App {
         };
         let branch_name = entry.name.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        let local_branch = git::checkout_remote_tracking_branch(&root, &branch_name)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.refresh_remote_branch_entries()?;
-        self.return_to_repo_view();
-        self.status_message = format!("Checked out remote branch {} as {}", branch_name, local_branch);
+        self.request_write_op(
+            &format!("Checking out remote branch {}", branch_name),
+            super::AsyncWriteOp::CheckoutRemoteBranch {
+                branch_name: branch_name.clone(),
+            },
+            move || git::checkout_remote_tracking_branch(&root, &branch_name).map(|_| ()),
+        );
         Ok(())
     }
 
@@ -85,35 +87,26 @@ impl App {
         }
         let branch_name = branch_name.to_string();
         let root = self.current_repo_root()?.to_path_buf();
-        git::create_and_switch_branch(&root, &branch_name)?;
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
         self.move_input_cursor_home();
-        self.snapshot = git::snapshot(&root)?;
-        self.refresh_branch_entries()?;
-        self.return_to_repo_view();
-        self.status_message = format!("Created and switched to branch {}", branch_name);
+        self.request_write_op(
+            &format!("Creating branch {}", branch_name),
+            super::AsyncWriteOp::CreateBranch {
+                branch_name: branch_name.clone(),
+            },
+            move || git::create_and_switch_branch(&root, &branch_name),
+        );
         Ok(())
     }
 
     pub(crate) fn refresh_branch_entries(&mut self) -> Result<()> {
-        let root = self.current_repo_root()?.to_path_buf();
-        self.branch_entries = git::list_local_branches(&root)?;
-        self.selected_branch = self
-            .branch_entries
-            .iter()
-            .position(|entry| entry.is_current)
-            .unwrap_or(0);
+        self.request_branch_entries_refresh()?;
         Ok(())
     }
 
     pub(crate) fn refresh_remote_branch_entries(&mut self) -> Result<()> {
-        let root = self.current_repo_root()?.to_path_buf();
-        self.remote_branch_entries = git::list_remote_branches(&root)?;
-        self.selected_remote_branch = min(
-            self.selected_remote_branch,
-            self.remote_branch_entries.len().saturating_sub(1),
-        );
+        self.request_remote_branch_entries_refresh()?;
         Ok(())
     }
 }

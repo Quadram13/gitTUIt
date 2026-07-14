@@ -1,10 +1,8 @@
-use std::cmp::min;
-
 use anyhow::Result;
 
 use crate::git;
 
-use super::{App, InputMode, Screen, truncate_lines};
+use super::{App, AppAsyncEvent, InputMode, JOB_STASH_DETAILS, JOB_STASH_ENTRIES, Screen};
 
 impl App {
     pub fn enter_stash_view(&mut self) -> Result<()> {
@@ -24,11 +22,9 @@ impl App {
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
-        git::stash_push(&root)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.refresh_stash_entries()?;
-        self.clear_stash_details();
-        self.status_message = "Stashed current changes".to_string();
+        self.request_write_op("Stashing current changes", super::AsyncWriteOp::StashPush, move || {
+            git::stash_push(&root)
+        });
         Ok(())
     }
 
@@ -39,9 +35,13 @@ impl App {
         };
         let reference = entry.reference.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        git::stash_apply(&root, &reference)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.status_message = format!("Applied {}", reference);
+        self.request_write_op(
+            &format!("Applying {}", reference),
+            super::AsyncWriteOp::StashApply {
+                reference: reference.clone(),
+            },
+            move || git::stash_apply(&root, &reference),
+        );
         Ok(())
     }
 
@@ -52,11 +52,13 @@ impl App {
         };
         let reference = entry.reference.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        git::stash_pop(&root, &reference)?;
-        self.snapshot = git::snapshot(&root)?;
-        self.refresh_stash_entries()?;
-        self.clear_stash_details();
-        self.status_message = format!("Popped {}", reference);
+        self.request_write_op(
+            &format!("Popping {}", reference),
+            super::AsyncWriteOp::StashPop {
+                reference: reference.clone(),
+            },
+            move || git::stash_pop(&root, &reference),
+        );
         Ok(())
     }
 
@@ -77,11 +79,14 @@ impl App {
             return Ok(());
         };
         let root = self.current_repo_root()?.to_path_buf();
-        git::stash_drop(&root, &reference)?;
         self.input_mode = InputMode::None;
-        self.refresh_stash_entries()?;
-        self.clear_stash_details();
-        self.status_message = format!("Dropped {}", reference);
+        self.request_write_op(
+            &format!("Dropping {}", reference),
+            super::AsyncWriteOp::StashDrop {
+                reference: reference.clone(),
+            },
+            move || git::stash_drop(&root, &reference),
+        );
         Ok(())
     }
 
@@ -96,17 +101,41 @@ impl App {
         }
         let reference = entry.reference.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        let details = git::stash_show(&root, &reference)?;
-        self.stash_details = truncate_lines(details, 220);
-        self.stash_details_for = Some(reference.clone());
-        self.status_message = format!("Loaded stash details {}", reference);
+        self.stash_details_request_seq = self.stash_details_request_seq.saturating_add(1);
+        let request_id = self.stash_details_request_seq;
+        self.stash_details_inflight = Some(request_id);
+        self.set_async_running_status(&format!("Loading stash details {}", reference));
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_STASH_DETAILS, request_id, move || {
+            let details = git::stash_show(&root, &reference).map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::StashDetailsReady {
+                request_id,
+                reference,
+                details,
+            });
+        }) {
+            self.stash_details_inflight = None;
+            return Err(err);
+        }
         Ok(())
     }
 
     pub(crate) fn refresh_stash_entries(&mut self) -> Result<()> {
         let root = self.current_repo_root()?.to_path_buf();
-        self.stash_entries = git::list_stashes(&root)?;
-        self.selected_stash = min(self.selected_stash, self.stash_entries.len().saturating_sub(1));
+        self.stash_entries_request_seq = self.stash_entries_request_seq.saturating_add(1);
+        let request_id = self.stash_entries_request_seq;
+        self.stash_entries_inflight = Some(request_id);
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_STASH_ENTRIES, request_id, move || {
+            let entries = git::list_stashes(&root).map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::StashEntriesReady {
+                request_id,
+                entries,
+            });
+        }) {
+            self.stash_entries_inflight = None;
+            return Err(err);
+        }
         Ok(())
     }
 }

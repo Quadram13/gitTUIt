@@ -1,7 +1,5 @@
 use anyhow::Result;
 
-use crate::git;
-
 use super::{App, Screen};
 
 impl App {
@@ -12,13 +10,12 @@ impl App {
         }
         self.screen = Screen::TrackingStatusView;
         self.refresh_tracking_status_summary()?;
-        self.status_message = "Incoming/outgoing commit comparison view".to_string();
+        self.set_async_running_status("Refreshing incoming/outgoing comparison");
         Ok(())
     }
 
     pub(crate) fn refresh_tracking_status_summary(&mut self) -> Result<()> {
-        let root = self.current_repo_root()?.to_path_buf();
-        self.tracking_summary = Some(git::tracking_commit_summary(&root, 30)?);
+        self.request_tracking_summary_refresh()?;
         Ok(())
     }
 }

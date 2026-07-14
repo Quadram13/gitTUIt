@@ -15,8 +15,7 @@ impl App {
         self.pending_pr_title = None;
         match self.refresh_pull_requests() {
             Ok(_) => {
-                self.status_message =
-                    "Pull requests: [Enter/o] open, [c] checkout, [m]/[s]/[R] merge".to_string();
+                self.set_async_running_status("Refreshing pull requests");
             }
             Err(err) => {
                 self.status_message = format_gh_error_for_status(&err);
@@ -37,7 +36,10 @@ impl App {
         };
         match self.refresh_pull_requests() {
             Ok(_) => {
-                self.status_message = format!("PR filter: {}", self.pull_request_filter_label());
+                self.set_async_running_status(&format!(
+                    "Refreshing pull requests ({})",
+                    self.pull_request_filter_label()
+                ));
             }
             Err(err) => {
                 self.status_message = format_gh_error_for_status(&err);
@@ -65,14 +67,11 @@ impl App {
         };
         let number = pr.number;
         let root = self.current_repo_root()?.to_path_buf();
-        match git::open_pr_in_browser(&root, number) {
-            Ok(_) => {
-                self.status_message = format!("Opened PR #{} in browser", number);
-            }
-            Err(err) => {
-                self.status_message = format_gh_error_for_status(&err);
-            }
-        }
+        self.request_write_op(
+            &format!("Opening PR #{} in browser", number),
+            super::AsyncWriteOp::OpenPrInBrowser { number },
+            move || git::open_pr_in_browser(&root, number),
+        );
         Ok(())
     }
 
@@ -83,16 +82,11 @@ impl App {
         };
         let number = pr.number;
         let root = self.current_repo_root()?.to_path_buf();
-        match git::checkout_pr(&root, number) {
-            Ok(_) => {
-                self.snapshot = git::snapshot(&root)?;
-                self.ensure_selection_bounds();
-                self.status_message = format!("Checked out PR #{}", number);
-            }
-            Err(err) => {
-                self.status_message = format_gh_error_for_status(&err);
-            }
-        }
+        self.request_write_op(
+            &format!("Checking out PR #{}", number),
+            super::AsyncWriteOp::CheckoutPullRequest { number },
+            move || git::checkout_pr(&root, number),
+        );
         Ok(())
     }
 
@@ -127,24 +121,15 @@ impl App {
         let method = pending.method;
         let number = pending.number;
         self.input_mode = InputMode::None;
-        match git::merge_pull_request(&root, number, method) {
-            Ok(_) => {
-                self.snapshot = git::snapshot(&root)?;
-                self.ensure_selection_bounds();
-                if let Err(err) = self.refresh_pull_requests() {
-                    self.status_message = format_gh_error_for_status(&err);
-                    return Ok(());
-                }
-                self.status_message = format!(
-                    "Merged PR #{} with {}",
-                    number,
-                    pull_request_merge_method_label(method)
-                );
-            }
-            Err(err) => {
-                self.status_message = format_gh_error_for_status(&err);
-            }
-        }
+        self.request_write_op(
+            &format!(
+                "Merging PR #{} with {}",
+                number,
+                pull_request_merge_method_label(method)
+            ),
+            super::AsyncWriteOp::MergePullRequest { number, method },
+            move || git::merge_pull_request(&root, number, method),
+        );
         Ok(())
     }
 

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.103"
+asyncgit = { git = "https://github.com/gitui-org/gitui", package = "asyncgit", rev = "685cca91fd5f83d1c6c14a0aefc057f71872acea" }
 crossterm = "0.29.0"
 dirs = "6.0.0"
 log = "0.4.33"

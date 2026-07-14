@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::git;
 
-use super::{App, Screen, truncate_lines};
+use super::{App, AppAsyncEvent, JOB_HISTORY_DETAILS, JOB_HISTORY_ENTRIES, Screen};
 
 impl App {
     pub fn enter_history_view(&mut self) -> Result<()> {
@@ -29,10 +29,23 @@ impl App {
         let commit_hash = entry.hash.clone();
         let short_hash = entry.short_hash.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        let details = git::commit_details(&root, &commit_hash)?;
-        self.history_details = truncate_lines(details, 240);
-        self.history_details_for = Some(commit_hash);
-        self.status_message = format!("Loaded commit details {}", short_hash);
+        self.history_details_request_seq = self.history_details_request_seq.saturating_add(1);
+        let request_id = self.history_details_request_seq;
+        self.history_details_inflight = Some(request_id);
+        self.set_async_running_status(&format!("Loading commit details {}", short_hash));
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_HISTORY_DETAILS, request_id, move || {
+            let details = git::commit_details(&root, &commit_hash).map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::HistoryDetailsReady {
+                request_id,
+                commit_hash,
+                short_hash,
+                details,
+            });
+        }) {
+            self.history_details_inflight = None;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -45,16 +58,13 @@ impl App {
         let commit_hash = entry.hash.clone();
         let short_hash = entry.short_hash.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        match git::checkout_detached(&root, &commit_hash) {
-            Ok(_) => {
-                self.snapshot = git::snapshot(&root)?;
-                self.clear_history_details();
-                self.status_message = format!("Checked out {} (detached HEAD)", short_hash);
-            }
-            Err(err) => {
-                self.status_message = format!("Checkout failed: {err}");
-            }
-        }
+        self.request_write_op(
+            &format!("Checking out {}", short_hash),
+            super::AsyncWriteOp::CheckoutDetached {
+                short_hash: short_hash.clone(),
+            },
+            move || git::checkout_detached(&root, &commit_hash),
+        );
         Ok(())
     }
 
@@ -67,27 +77,32 @@ impl App {
         let commit_hash = entry.hash.clone();
         let short_hash = entry.short_hash.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        match git::cherry_pick(&root, &commit_hash) {
-            Ok(_) => {
-                self.snapshot = git::snapshot(&root)?;
-                self.refresh_history_entries()?;
-                self.status_message = format!("Cherry-picked {}", short_hash);
-            }
-            Err(err) => {
-                self.status_message = format!("Cherry-pick failed: {err}");
-            }
-        }
+        self.request_write_op(
+            &format!("Cherry-picking {}", short_hash),
+            super::AsyncWriteOp::CherryPickCommit {
+                short_hash: short_hash.clone(),
+            },
+            move || git::cherry_pick(&root, &commit_hash),
+        );
         Ok(())
     }
 
     pub(crate) fn refresh_history_entries(&mut self) -> Result<()> {
         let root = self.current_repo_root()?.to_path_buf();
-        self.history_entries = git::commit_history(&root, 50)?;
-        self.selected_history = std::cmp::min(
-            self.selected_history,
-            self.history_entries.len().saturating_sub(1),
-        );
-        self.clear_history_details();
+        self.history_entries_request_seq = self.history_entries_request_seq.saturating_add(1);
+        let request_id = self.history_entries_request_seq;
+        self.history_entries_inflight = Some(request_id);
+        let tx = self.async_tx.clone();
+        if let Err(err) = self.queue_cancellable_async_task(JOB_HISTORY_ENTRIES, request_id, move || {
+            let entries = git::commit_history(&root, 50).map_err(|err| err.to_string());
+            let _ = tx.send(AppAsyncEvent::HistoryEntriesReady {
+                request_id,
+                entries,
+            });
+        }) {
+            self.history_entries_inflight = None;
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -108,5 +123,6 @@ impl App {
     pub(crate) fn clear_history_details(&mut self) {
         self.history_details.clear();
         self.history_details_for = None;
+        self.history_details_inflight = None;
     }
 }

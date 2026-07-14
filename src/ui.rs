@@ -552,20 +552,35 @@ fn draw_commit_popup(frame: &mut Frame, app: &App) {
     };
     let title = truncate_for_width(app.popup_title(), popup.width.saturating_sub(4) as usize);
     frame.render_widget(Clear, popup);
-    let popup_text = popup_text_with_cursor(app);
+    let (popup_text, cursor_line, cursor_col) = popup_text_with_cursor(app);
+    let body_height = popup.height.saturating_sub(2) as usize;
+    let body_width = popup.width.saturating_sub(2) as usize;
+    let scroll_y = if body_height == 0 {
+        0
+    } else {
+        cursor_line.saturating_sub(body_height.saturating_sub(1))
+    };
+    let scroll_x = if body_width == 0 {
+        0
+    } else {
+        cursor_col.saturating_sub(body_width.saturating_sub(1))
+    };
     let input = Paragraph::new(popup_text)
+        .scroll((
+            scroll_y.min(u16::MAX as usize) as u16,
+            scroll_x.min(u16::MAX as usize) as u16,
+        ))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title(title),
-        )
-        .wrap(Wrap { trim: false });
+        );
     frame.render_widget(input, popup);
 }
 
-fn popup_text_with_cursor(app: &App) -> Text<'static> {
+fn popup_text_with_cursor(app: &App) -> (Text<'static>, usize, usize) {
     let Some(input) = app.popup_input_text() else {
-        return Text::from(app.popup_body());
+        return (Text::from(app.popup_body()), 0, 0);
     };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -579,21 +594,39 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
 
     let chars = input.chars().collect::<Vec<_>>();
     let cursor = app.popup_input_cursor().min(chars.len());
+    let mut input_cursor_col = 0usize;
+    for ch in chars.iter().take(cursor) {
+        if *ch == '\n' {
+            input_cursor_col = 0;
+        } else {
+            input_cursor_col += 1;
+        }
+    }
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut current_line_idx = lines.len();
+    let mut cursor_line: Option<usize> = None;
     for (idx, ch) in chars.iter().enumerate() {
         if idx == cursor && *ch == '\n' {
+            if cursor_line.is_none() {
+                cursor_line = Some(current_line_idx);
+            }
             spans.push(Span::styled(
                 " ".to_string(),
                 Style::default().add_modifier(Modifier::REVERSED),
             ));
             lines.push(Line::from(std::mem::take(&mut spans)));
+            current_line_idx += 1;
             continue;
         }
         if *ch == '\n' {
             lines.push(Line::from(std::mem::take(&mut spans)));
+            current_line_idx += 1;
             continue;
         }
         if idx == cursor {
+            if cursor_line.is_none() {
+                cursor_line = Some(current_line_idx);
+            }
             spans.push(Span::styled(
                 ch.to_string(),
                 Style::default().add_modifier(Modifier::REVERSED),
@@ -603,6 +636,9 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
         }
     }
     if cursor == chars.len() {
+        if cursor_line.is_none() {
+            cursor_line = Some(current_line_idx);
+        }
         spans.push(Span::styled(
             " ".to_string(),
             Style::default().add_modifier(Modifier::REVERSED),
@@ -619,7 +655,11 @@ fn popup_text_with_cursor(app: &App) -> Text<'static> {
     if !spans.is_empty() || lines.is_empty() {
         lines.push(Line::from(spans));
     }
-    Text::from(lines)
+    (
+        Text::from(lines),
+        cursor_line.unwrap_or(current_line_idx),
+        input_cursor_col,
+    )
 }
 
 fn draw_help_popup(frame: &mut Frame, app: &App) {

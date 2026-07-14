@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::git;
+use crate::tree::changed_files_tree::{FileLeaf, TreeRowKind};
 
 use super::{
     App, AppAsyncEvent, HistoryFocusPane, JOB_HISTORY_DETAILS, JOB_HISTORY_ENTRIES,
@@ -83,7 +84,13 @@ impl App {
                 self.history_focus = HistoryFocusPane::ChangedFiles;
                 self.status_message = "History focus: changed files".to_string();
             }
-            HistoryFocusPane::ChangedFiles => self.open_selected_history_file_diff()?,
+            HistoryFocusPane::ChangedFiles => {
+                if self.expand_selected_history_directory() {
+                    self.status_message = "Expanded folder".to_string();
+                } else {
+                    self.open_selected_history_file_diff()?;
+                }
+            }
             HistoryFocusPane::FileHistory => self.open_selected_history_file_history_diff()?,
         }
         Ok(())
@@ -93,9 +100,13 @@ impl App {
         match self.history_focus {
             HistoryFocusPane::Commits => {}
             HistoryFocusPane::ChangedFiles => {
-                self.history_focus = HistoryFocusPane::Commits;
-                self.clear_history_file_history();
-                self.status_message = "History focus: commits".to_string();
+                if self.collapse_selected_history_directory() {
+                    self.status_message = "Collapsed folder".to_string();
+                } else {
+                    self.history_focus = HistoryFocusPane::Commits;
+                    self.clear_history_file_history();
+                    self.status_message = "History focus: commits".to_string();
+                }
             }
             HistoryFocusPane::FileHistory => {
                 self.history_focus = HistoryFocusPane::ChangedFiles;
@@ -113,7 +124,7 @@ impl App {
             return Ok(());
         };
         let Some(path) = self.selected_history_file_path() else {
-            self.status_message = "No changed file selected".to_string();
+            self.status_message = "Select a file (not a folder) to open diff".to_string();
             return Ok(());
         };
 
@@ -148,7 +159,7 @@ impl App {
             return Ok(());
         };
         let Some(path) = self.selected_history_file_path() else {
-            self.status_message = "No changed file selected".to_string();
+            self.status_message = "Select a file (not a folder) to open file history".to_string();
             return Ok(());
         };
         let root = self.current_repo_root()?.to_path_buf();
@@ -317,6 +328,7 @@ impl App {
         self.history_details = None;
         self.history_details_for = None;
         self.history_details_inflight = None;
+        self.history_tree.clear();
         self.history_file_tree_selected = 0;
         self.history_focus = HistoryFocusPane::Commits;
         self.clear_history_file_history();
@@ -330,10 +342,7 @@ impl App {
     }
 
     pub(crate) fn selected_history_file_path(&self) -> Option<String> {
-        self.history_details
-            .as_ref()
-            .and_then(|details| details.files.get(self.history_file_tree_selected))
-            .map(|file| file.path.clone())
+        self.history_tree.selected_file_path(self.history_file_tree_selected)
     }
 
     pub fn history_details_visible(&self) -> bool {
@@ -374,12 +383,8 @@ impl App {
                 .unwrap_or_else(|| "<none>".to_string());
             return format!("File History ({path}) [Right open diff, Left back]");
         }
-        let count = self
-            .history_details
-            .as_ref()
-            .map(|details| details.files.len())
-            .unwrap_or(0);
-        format!("Changed Files ({count}) [h history, Right diff]")
+        let count = self.history_tree.len();
+        format!("Changed Files ({count}) [Left fold/back, h history, Right expand/diff]")
     }
 
     pub fn history_files_items(&self) -> Vec<String> {
@@ -400,17 +405,21 @@ impl App {
         if details.files.is_empty() {
             return vec!["No changed files".to_string()];
         }
-        details
-            .files
+        self.history_tree
+            .rows()
             .iter()
-            .map(|file| {
-                let depth = file.path.matches('/').count() + file.path.matches('\\').count();
-                let name = file
-                    .path
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(file.path.as_str());
-                format!("[{}] {}{}", file.status, "  ".repeat(depth), name)
+            .map(|row| {
+                let indent = "  ".repeat(row.depth);
+                match row.kind {
+                    TreeRowKind::Directory => {
+                        let marker = if row.expanded { "[-]" } else { "[+]" };
+                        format!("{indent}{marker} {}", row.name)
+                    }
+                    TreeRowKind::File => {
+                        let status = row.status.as_deref().unwrap_or("?");
+                        format!("{indent}[{status}] {}", row.name)
+                    }
+                }
             })
             .collect()
     }
@@ -423,12 +432,61 @@ impl App {
                 Some(self.history_file_history_selected)
             }
         } else {
-            let count = self
-                .history_details
-                .as_ref()
-                .map(|details| details.files.len())
-                .unwrap_or(0);
+            let count = self.history_tree.len();
             (count > 0).then_some(self.history_file_tree_selected)
         }
     }
+
+    pub(crate) fn rebuild_history_tree_rows(&mut self) {
+        let Some(details) = self.history_details.as_ref() else {
+            self.history_tree.clear();
+            self.history_file_tree_selected = 0;
+            return;
+        };
+        self.history_tree.set_files(
+            details
+                .files
+                .iter()
+                .map(|file| FileLeaf {
+                    path: file.path.clone(),
+                    status: file.status.clone(),
+                })
+                .collect(),
+        );
+        if self.history_tree.len() == 0 {
+            self.history_file_tree_selected = 0;
+        } else {
+            self.history_file_tree_selected =
+                self.history_file_tree_selected.min(self.history_tree.len().saturating_sub(1));
+        }
+    }
+
+    pub(crate) fn expand_all_history_dirs(&mut self) {
+        self.rebuild_history_tree_rows();
+        self.history_tree.expand_all_dirs();
+    }
+
+    fn expand_selected_history_directory(&mut self) -> bool {
+        self.history_tree
+            .expand_selected_dir(self.history_file_tree_selected)
+    }
+
+    fn collapse_selected_history_directory(&mut self) -> bool {
+        let selected_path = self
+            .history_tree
+            .row_path(self.history_file_tree_selected)
+            .map(|path| path.to_string());
+        let collapsed = self
+            .history_tree
+            .collapse_selected_dir(self.history_file_tree_selected);
+        if collapsed {
+            if let Some(path) = selected_path {
+                if let Some(new_idx) = self.history_tree.find_row_index_by_path(&path) {
+                    self.history_file_tree_selected = new_idx;
+                }
+            }
+        }
+        collapsed
+    }
 }
+

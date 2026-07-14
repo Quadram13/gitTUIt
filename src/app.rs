@@ -17,7 +17,7 @@ use crate::{
     diagnostics,
     git::{
         self, BranchEntry as GitBranchEntry, CommitDetails as GitCommitDetails,
-        CommitEntry as GitCommitEntry, FileEntry,
+        CommitEntry as GitCommitEntry,
         PullRequestMergeMethod as GitPullRequestMergeMethod,
         PullRequestEntry as GitPullRequestEntry, PullRequestFilter as GitPullRequestFilter,
         PullRequestStatusSummary as GitPullRequestStatusSummary,
@@ -25,6 +25,7 @@ use crate::{
         TrackingCommitSummary as GitTrackingCommitSummary,
     },
     repo_registry::{RepoRegistry, canonical_repo_path, normalize_repo_path_input},
+    tree::changed_files_tree::{ChangedFilesTree, FileLeaf, TreeRow, TreeRowKind},
 };
 
 mod pull_requests;
@@ -325,6 +326,8 @@ pub struct App {
     pub repo_root: Option<PathBuf>,
     pub snapshot: RepoSnapshot,
     pub focus: FocusPane,
+    unstaged_tree: ChangedFilesTree,
+    staged_tree: ChangedFilesTree,
     pub selected_unstaged: usize,
     pub selected_staged: usize,
     pub status_message: String,
@@ -342,6 +345,7 @@ pub struct App {
     history_focus: HistoryFocusPane,
     history_details: Option<GitCommitDetails>,
     history_details_for: Option<String>,
+    history_tree: ChangedFilesTree,
     history_file_tree_selected: usize,
     history_file_history_entries: Vec<GitCommitEntry>,
     history_file_history_selected: usize,
@@ -447,6 +451,8 @@ impl App {
             repo_root: None,
             snapshot: RepoSnapshot::default(),
             focus: FocusPane::Unstaged,
+            unstaged_tree: ChangedFilesTree::default(),
+            staged_tree: ChangedFilesTree::default(),
             selected_unstaged: 0,
             selected_staged: 0,
             status_message: String::new(),
@@ -464,6 +470,7 @@ impl App {
             history_focus: HistoryFocusPane::Commits,
             history_details: None,
             history_details_for: None,
+            history_tree: ChangedFilesTree::default(),
             history_file_tree_selected: 0,
             history_file_history_entries: Vec::new(),
             history_file_history_selected: 0,
@@ -820,7 +827,8 @@ impl App {
                         "[u]/[U] unstage selected/all staged".to_string(),
                         "[x] discard selected unstaged (confirm)".to_string(),
                         "[c] commit staged changes".to_string(),
-                        "[Right] open fullscreen diff (selected file)".to_string(),
+                        "[Right] expand folder / open file diff".to_string(),
+                        "[Left] collapse folder".to_string(),
                     ],
                 );
                 section(
@@ -988,11 +996,7 @@ impl App {
                             }
                         }
                         HistoryFocusPane::ChangedFiles => {
-                            let file_count = self
-                                .history_details
-                                .as_ref()
-                                .map(|details| details.files.len())
-                                .unwrap_or(0);
+                            let file_count = self.history_tree.len();
                             if file_count > 0 {
                                 self.history_file_tree_selected =
                                     min(self.history_file_tree_selected + 1, file_count - 1);
@@ -1028,16 +1032,16 @@ impl App {
             }
             Screen::RepoView => match self.focus {
                 FocusPane::Unstaged => {
-                    if !self.snapshot.unstaged.is_empty() {
+                    if self.unstaged_tree.len() > 0 {
                         self.selected_unstaged =
-                            min(self.selected_unstaged + 1, self.snapshot.unstaged.len() - 1);
+                            min(self.selected_unstaged + 1, self.unstaged_tree.len() - 1);
                         self.invalidate_repo_preview_cache();
                         self.schedule_repo_preview_refresh();
                     }
                 }
                 FocusPane::Staged => {
-                    if !self.snapshot.staged.is_empty() {
-                        self.selected_staged = min(self.selected_staged + 1, self.snapshot.staged.len() - 1);
+                    if self.staged_tree.len() > 0 {
+                        self.selected_staged = min(self.selected_staged + 1, self.staged_tree.len() - 1);
                         self.invalidate_repo_preview_cache();
                         self.schedule_repo_preview_refresh();
                     }
@@ -1344,14 +1348,18 @@ impl App {
     }
 
     pub fn stage_selected(&mut self) -> Result<()> {
-        let Some(entry) = self.current_unstaged() else {
-            self.status_message = "No unstaged file selected".to_string();
+        let Some(row) = self.current_unstaged_row() else {
+            self.status_message = "No unstaged path selected".to_string();
             return Ok(());
         };
-        let path = entry.path.clone();
+        let path = row.path.clone();
+        let label = match row.kind {
+            TreeRowKind::Directory => format!("Staging directory {}", path),
+            TreeRowKind::File => format!("Staging {}", path),
+        };
         let root = self.current_repo_root()?.to_path_buf();
         self.request_write_op(
-            &format!("Staging {}", path),
+            &label,
             AsyncWriteOp::StageFile { path: path.clone() },
             move || git::stage_file(&root, &path),
         );
@@ -1359,14 +1367,18 @@ impl App {
     }
 
     pub fn unstage_selected(&mut self) -> Result<()> {
-        let Some(entry) = self.current_staged() else {
-            self.status_message = "No staged file selected".to_string();
+        let Some(row) = self.current_staged_row() else {
+            self.status_message = "No staged path selected".to_string();
             return Ok(());
         };
-        let path = entry.path.clone();
+        let path = row.path.clone();
+        let label = match row.kind {
+            TreeRowKind::Directory => format!("Unstaging directory {}", path),
+            TreeRowKind::File => format!("Unstaging {}", path),
+        };
         let root = self.current_repo_root()?.to_path_buf();
         self.request_write_op(
-            &format!("Unstaging {}", path),
+            &label,
             AsyncWriteOp::UnstageFile { path: path.clone() },
             move || git::unstage_file(&root, &path),
         );
@@ -1468,13 +1480,17 @@ impl App {
     }
 
     pub fn discard_selected_unstaged(&mut self) -> Result<()> {
-        let Some(entry) = self.current_unstaged() else {
+        let Some(entry) = self.current_unstaged_row() else {
             self.status_message = "No unstaged file selected".to_string();
             return Ok(());
         };
+        if entry.kind == TreeRowKind::Directory {
+            self.status_message = "Discard is file-only; select a file inside the folder".to_string();
+            return Ok(());
+        }
         self.pending_discard = Some(PendingDiscard {
             path: entry.path.clone(),
-            is_untracked: entry.status == "??",
+            is_untracked: entry.status.as_deref() == Some("??"),
         });
         self.input_mode = InputMode::ConfirmDiscard;
         self.status_message = "Confirm discard: [y] confirm, [n]/[Esc] cancel".to_string();
@@ -1536,6 +1552,8 @@ impl App {
         self.screen = Screen::RepoPicker;
         self.repo_root = None;
         self.snapshot = RepoSnapshot::default();
+        self.unstaged_tree.clear();
+        self.staged_tree.clear();
         self.branch_entries.clear();
         self.selected_branch = 0;
         self.remote_branch_entries.clear();
@@ -2126,27 +2144,54 @@ impl App {
             .ok_or_else(|| anyhow!("No repository is currently open"))
     }
 
-    fn current_unstaged(&self) -> Option<&FileEntry> {
-        self.snapshot.unstaged.get(self.selected_unstaged)
+    fn current_unstaged_row(&self) -> Option<&TreeRow> {
+        self.unstaged_tree.row(self.selected_unstaged)
     }
 
-    fn current_staged(&self) -> Option<&FileEntry> {
-        self.snapshot.staged.get(self.selected_staged)
+    fn current_staged_row(&self) -> Option<&TreeRow> {
+        self.staged_tree.row(self.selected_staged)
     }
 
     fn ensure_selection_bounds(&mut self) {
-        if self.snapshot.unstaged.is_empty() {
+        self.rebuild_status_trees();
+        if self.unstaged_tree.len() == 0 {
             self.selected_unstaged = 0;
         } else {
-            self.selected_unstaged = min(self.selected_unstaged, self.snapshot.unstaged.len() - 1);
+            self.selected_unstaged = min(self.selected_unstaged, self.unstaged_tree.len() - 1);
         }
-        if self.snapshot.staged.is_empty() {
+        if self.staged_tree.len() == 0 {
             self.selected_staged = 0;
         } else {
-            self.selected_staged = min(self.selected_staged, self.snapshot.staged.len() - 1);
+            self.selected_staged = min(self.selected_staged, self.staged_tree.len() - 1);
         }
         self.invalidate_repo_preview_cache();
         self.schedule_repo_preview_refresh();
+    }
+
+    fn rebuild_status_trees(&mut self) {
+        self.unstaged_tree.set_files(
+            self.snapshot
+                .unstaged
+                .iter()
+                .map(|entry| FileLeaf {
+                    path: entry.path.clone(),
+                    status: entry.status.clone(),
+                })
+                .collect(),
+        );
+        self.unstaged_tree.expand_all_dirs();
+
+        self.staged_tree.set_files(
+            self.snapshot
+                .staged
+                .iter()
+                .map(|entry| FileLeaf {
+                    path: entry.path.clone(),
+                    status: entry.status.clone(),
+                })
+                .collect(),
+        );
+        self.staged_tree.expand_all_dirs();
     }
 
     fn pull_request_preview_text(&self) -> String {
@@ -2298,6 +2343,7 @@ impl App {
                             self.history_details_for = Some(commit_hash);
                             self.history_file_tree_selected = 0;
                             self.clear_history_file_history();
+                            self.expand_all_history_dirs();
                             self.status_message = format!("Loaded commit details {}", short_hash);
                         }
                         Err(err) => {
@@ -2973,14 +3019,26 @@ impl App {
             return Ok(());
         };
         let (path, staged) = match self.focus {
-            FocusPane::Unstaged => self
-                .current_unstaged()
-                .map(|entry| (entry.path.clone(), false))
-                .ok_or_else(|| anyhow!("No unstaged file selected"))?,
-            FocusPane::Staged => self
-                .current_staged()
-                .map(|entry| (entry.path.clone(), true))
-                .ok_or_else(|| anyhow!("No staged file selected"))?,
+            FocusPane::Unstaged => {
+                let row = self
+                    .current_unstaged_row()
+                    .ok_or_else(|| anyhow!("No unstaged path selected"))?;
+                if row.kind != TreeRowKind::File {
+                    self.status_message = "Select a file to open diff preview".to_string();
+                    return Ok(());
+                }
+                (row.path.clone(), false)
+            }
+            FocusPane::Staged => {
+                let row = self
+                    .current_staged_row()
+                    .ok_or_else(|| anyhow!("No staged path selected"))?;
+                if row.kind != TreeRowKind::File {
+                    self.status_message = "Select a file to open diff preview".to_string();
+                    return Ok(());
+                }
+                (row.path.clone(), true)
+            }
         };
         let title = if staged {
             format!("Staged Diff: {path}")
@@ -2990,6 +3048,70 @@ impl App {
         let key = format!("status:{}:{path}", if staged { "staged" } else { "unstaged" });
         self.request_fullscreen_diff(title, key, move || git::diff_for_file(&root, &path, staged))?;
         Ok(())
+    }
+
+    pub fn status_tree_focus_right(&mut self) -> Result<()> {
+        if self.screen != Screen::RepoView {
+            return Ok(());
+        }
+        let expanded = match self.focus {
+            FocusPane::Unstaged => self.unstaged_tree.expand_selected_dir(self.selected_unstaged),
+            FocusPane::Staged => self.staged_tree.expand_selected_dir(self.selected_staged),
+        };
+        if expanded {
+            self.status_message = "Expanded folder".to_string();
+            return Ok(());
+        }
+        self.open_status_fullscreen_diff()
+    }
+
+    pub fn status_tree_focus_left(&mut self) {
+        if self.screen != Screen::RepoView {
+            return;
+        }
+        let collapsed = match self.focus {
+            FocusPane::Unstaged => {
+                let selected_path = self
+                    .unstaged_tree
+                    .row_path(self.selected_unstaged)
+                    .map(|path| path.to_string());
+                let collapsed = self.unstaged_tree.collapse_selected_dir(self.selected_unstaged);
+                if collapsed {
+                    if let Some(path) = selected_path {
+                        if let Some(new_idx) = self.unstaged_tree.find_row_index_by_path(&path) {
+                            self.selected_unstaged = new_idx;
+                        }
+                    }
+                }
+                collapsed
+            }
+            FocusPane::Staged => {
+                let selected_path = self
+                    .staged_tree
+                    .row_path(self.selected_staged)
+                    .map(|path| path.to_string());
+                let collapsed = self.staged_tree.collapse_selected_dir(self.selected_staged);
+                if collapsed {
+                    if let Some(path) = selected_path {
+                        if let Some(new_idx) = self.staged_tree.find_row_index_by_path(&path) {
+                            self.selected_staged = new_idx;
+                        }
+                    }
+                }
+                collapsed
+            }
+        };
+        if collapsed {
+            self.status_message = "Collapsed folder".to_string();
+        }
+    }
+
+    pub fn unstaged_tree_rows(&self) -> &[TreeRow] {
+        self.unstaged_tree.rows()
+    }
+
+    pub fn staged_tree_rows(&self) -> &[TreeRow] {
+        self.staged_tree.rows()
     }
 
     pub fn fullscreen_diff_move_down(&mut self) {
@@ -3168,13 +3290,25 @@ impl App {
         };
 
         let (path, staged, empty_text) = match self.focus {
-            FocusPane::Unstaged => self.current_unstaged().map_or_else(
+            FocusPane::Unstaged => self.current_unstaged_row().map_or_else(
                 || (String::new(), false, self.empty_repo_preview_text()),
-                |file| (file.path.clone(), false, self.empty_repo_preview_text()),
+                |row| {
+                    if row.kind == TreeRowKind::File {
+                        (row.path.clone(), false, self.empty_repo_preview_text())
+                    } else {
+                        (String::new(), false, "Select a file to preview diff.".to_string())
+                    }
+                },
             ),
-            FocusPane::Staged => self.current_staged().map_or_else(
+            FocusPane::Staged => self.current_staged_row().map_or_else(
                 || (String::new(), true, self.empty_repo_preview_text()),
-                |file| (file.path.clone(), true, self.empty_repo_preview_text()),
+                |row| {
+                    if row.kind == TreeRowKind::File {
+                        (row.path.clone(), true, self.empty_repo_preview_text())
+                    } else {
+                        (String::new(), true, "Select a file to preview diff.".to_string())
+                    }
+                },
             ),
         };
         if path.is_empty() {
@@ -3255,13 +3389,16 @@ impl App {
 
     fn current_repo_preview_key(&self) -> Option<String> {
         match self.focus {
-            FocusPane::Unstaged => self.current_unstaged().map(|entry| format!(
-                "unstaged:{}:{}",
-                self.selected_unstaged, entry.path
-            )),
+            FocusPane::Unstaged => self.current_unstaged_row().and_then(|row| {
+                (row.kind == TreeRowKind::File)
+                    .then_some(format!("unstaged:{}:{}", self.selected_unstaged, row.path))
+            }),
             FocusPane::Staged => self
-                .current_staged()
-                .map(|entry| format!("staged:{}:{}", self.selected_staged, entry.path)),
+                .current_staged_row()
+                .and_then(|row| {
+                    (row.kind == TreeRowKind::File)
+                        .then_some(format!("staged:{}:{}", self.selected_staged, row.path))
+                }),
         }
     }
 

@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{App, FocusPane, HistoryFocusPane, InputMode, Screen};
+use crate::tree::changed_files_tree::TreeRowKind;
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let root = frame.area();
@@ -477,13 +478,28 @@ fn draw_stash_view(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_unstaged(frame: &mut Frame, app: &App, area: Rect) {
-    let items = if app.snapshot.unstaged.is_empty() {
+    let items = if app.unstaged_tree_rows().is_empty() {
         vec![ListItem::new("No unstaged changes")]
     } else {
-        app.snapshot
-            .unstaged
+        app.unstaged_tree_rows()
             .iter()
-            .map(|entry| ListItem::new(format!("[{}] {}", entry.status, entry.path)))
+            .map(|entry| {
+                let indent = "  ".repeat(entry.depth);
+                let label = match entry.kind {
+                    TreeRowKind::Directory => {
+                        let marker = if entry.expanded { "[-]" } else { "[+]" };
+                        format!("{indent}{marker} {}", entry.name)
+                    }
+                    TreeRowKind::File => {
+                        format!(
+                            "{indent}[{}] {}",
+                            entry.status.as_deref().unwrap_or("?"),
+                            entry.name
+                        )
+                    }
+                };
+                ListItem::new(label)
+            })
             .collect()
     };
     let border_style = if app.focus == FocusPane::Unstaged {
@@ -495,27 +511,42 @@ fn draw_unstaged(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Unstaged ([s/S] stage/all, [x] discard)")
+                .title("Unstaged ([s/S] stage/all, [x] discard file, [Left/Right] fold/expand)")
                 .border_style(border_style),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
     let mut state = ListState::default();
-    if !app.snapshot.unstaged.is_empty() {
+    if !app.unstaged_tree_rows().is_empty() {
         state.select(Some(app.selected_unstaged));
     }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_staged(frame: &mut Frame, app: &App, area: Rect) {
-    let items = if app.snapshot.staged.is_empty() {
+    let items = if app.staged_tree_rows().is_empty() {
         vec![ListItem::new("No staged changes")]
     } else {
-        app.snapshot
-            .staged
+        app.staged_tree_rows()
             .iter()
-            .map(|entry| ListItem::new(format!("[{}] {}", entry.status, entry.path)))
+            .map(|entry| {
+                let indent = "  ".repeat(entry.depth);
+                let label = match entry.kind {
+                    TreeRowKind::Directory => {
+                        let marker = if entry.expanded { "[-]" } else { "[+]" };
+                        format!("{indent}{marker} {}", entry.name)
+                    }
+                    TreeRowKind::File => {
+                        format!(
+                            "{indent}[{}] {}",
+                            entry.status.as_deref().unwrap_or("?"),
+                            entry.name
+                        )
+                    }
+                };
+                ListItem::new(label)
+            })
             .collect()
     };
     let border_style = if app.focus == FocusPane::Staged {
@@ -527,14 +558,14 @@ fn draw_staged(frame: &mut Frame, app: &App, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Staged ([u/U] unstage/all, [c] commit)")
+                .title("Staged ([u/U] unstage/all, [c] commit, [Left/Right] fold/expand)")
                 .border_style(border_style),
         )
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
     let mut state = ListState::default();
-    if !app.snapshot.staged.is_empty() {
+    if !app.staged_tree_rows().is_empty() {
         state.select(Some(app.selected_staged));
     }
     frame.render_stateful_widget(list, area, &mut state);

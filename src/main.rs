@@ -2,6 +2,7 @@ mod app;
 mod diagnostics;
 mod git;
 mod repo_registry;
+mod tree;
 mod ui;
 
 use std::{env, time::Duration};
@@ -179,8 +180,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
             KeyCode::Up | KeyCode::Char('k') => app.move_prev(),
             KeyCode::Tab => app.cycle_focus(),
             KeyCode::Left if app.screen == Screen::HistoryView => app.history_focus_left(),
+            KeyCode::Left if app.screen == Screen::RepoView => app.status_tree_focus_left(),
             KeyCode::Right if app.screen == Screen::RepoView => {
-                action_result = Some(app.open_status_fullscreen_diff())
+                action_result = Some(app.status_tree_focus_right())
             }
             KeyCode::Right if app.screen == Screen::HistoryView => {
                 action_result = Some(app.history_focus_right())

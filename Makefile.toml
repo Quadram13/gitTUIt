@@ -82,13 +82,13 @@ dependencies = ["merge-pr-windows", "merge-pr-unix"]
 private = true
 condition = { platforms = ["windows"] }
 command = "pwsh"
-args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "merge-pr", "${MERGE_BRANCH}"]
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "merge-pr", "${MERGE_BRANCH}", "${BASE_BRANCH}"]
 
 [tasks.merge-pr-unix]
 private = true
 condition = { platforms = ["linux", "mac"] }
 command = "bash"
-args = ["scripts/workspace_release.sh", "merge-pr", "${MERGE_BRANCH}"]
+args = ["scripts/workspace_release.sh", "merge-pr", "${MERGE_BRANCH}", "${BASE_BRANCH}"]
 
 [tasks.merge-release-pr]
 description = "Merge release pull request for RELEASE_BRANCH or current branch."
@@ -98,13 +98,13 @@ dependencies = ["merge-release-pr-windows", "merge-release-pr-unix"]
 private = true
 condition = { platforms = ["windows"] }
 command = "pwsh"
-args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "merge-release-pr", "${RELEASE_BRANCH}"]
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "merge-release-pr", "${RELEASE_BRANCH}", "${BASE_BRANCH}"]
 
 [tasks.merge-release-pr-unix]
 private = true
 condition = { platforms = ["linux", "mac"] }
 command = "bash"
-args = ["scripts/workspace_release.sh", "merge-release-pr", "${RELEASE_BRANCH}"]
+args = ["scripts/workspace_release.sh", "merge-release-pr", "${RELEASE_BRANCH}", "${BASE_BRANCH}"]
 
 [tasks.validate-commit-message]
 description = "Validate commit message from COMMIT_MSG_FILE."

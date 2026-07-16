@@ -16,9 +16,39 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect releasable commit units (feat/fix only)
+        id: releasable
+        shell: bash
+        run: |
+          set -euo pipefail
+          last_tag="$(git tag --list 'gitTUIt-v*' --sort=-v:refname | head -n 1)"
+          if [[ -n "$last_tag" ]]; then
+            range="${last_tag}..HEAD"
+          else
+            range="HEAD"
+          fi
+
+          if git log "$range" --format=%s | grep -Eiq '^(feat|fix)(\([^)]+\))?!?: '; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Detected releasable commits in range: $range"
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "No releasable feat/fix commits in range: $range"
+          fi
+
       - name: Run release-please manifest
+        if: steps.releasable.outputs.should_run == 'true'
         uses: googleapis/release-please-action@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Skip release-please
+        if: steps.releasable.outputs.should_run != 'true'
+        run: echo "Skipping release-please; no feat/fix releasable commits found."

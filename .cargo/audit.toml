@@ -1,0 +1,8 @@
+[advisories]
+# Temporary ignore:
+# - RUSTSEC-2023-0071 is currently transitive via asyncgit -> ssh-key -> rsa.
+# - No fixed upgrade is available at this time.
+ignore = ["RUSTSEC-2023-0071"]
+
+[yanked]
+enabled = false

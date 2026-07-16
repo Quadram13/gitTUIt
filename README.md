@@ -150,6 +150,12 @@ Notes:
 - Hook installation requires manual setup (`git config core.hooksPath .githooks`).
 - Task scripts are available for both Windows PowerShell and Bash (macOS/Linux).
 
+### Security Audit
+
+- CI runs `cargo audit` via `.github/workflows/security-audit.yml`.
+- `.cargo/audit.toml` currently ignores `RUSTSEC-2023-0071` (transitive via `asyncgit -> ssh-key -> rsa`) because no fixed upstream upgrade is available yet.
+- This ignore should be removed once an upstream dependency fix is available.
+
 ## Repository Tracking
 
 - Repositories are tracked only when explicitly introduced by the user.
@@ -161,3 +167,7 @@ Config directory resolution:
 - If `GITTUIT_CONFIG_DIR` is set, that directory is used for `repos.json`.
 - Otherwise, debug builds (for example `cargo run`) use `gitTUIt-dev` under the OS config directory.
 - Release builds use `gitTUIt` under the OS config directory.
+
+## License
+
+This project is licensed under the MIT License. See `LICENSE`.

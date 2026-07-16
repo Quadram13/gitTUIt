@@ -104,8 +104,6 @@ This repo currently uses Release Please on `main` for the release flow:
 - `.release-please-manifest.json`
 - `CHANGELOG.md`
 
-Release Please is workflow-gated to run only when commits since the latest `gitTUIt-v*` tag include `feat`/`fix` Conventional Commit headers.
-
 Current release component naming:
 
 - `gitTUIt` -> `gitTUIt-vX.Y.Z`

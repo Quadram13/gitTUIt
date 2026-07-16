@@ -1,0 +1,48 @@
+name: Release PR Lock Sync
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release-pr-lock-sync-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  sync-lockfile:
+    if: "${{ startsWith(github.event.pull_request.title, 'chore: release') && github.event.pull_request.head.repo.full_name == github.repository }}"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout release PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.repository }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Refresh lockfile
+        run: cargo metadata --format-version=1 > /dev/null
+
+      - name: Commit and push lockfile updates
+        shell: bash
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore(repo): sync Cargo.lock for release PR"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"

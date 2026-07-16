@@ -1,0 +1,123 @@
+[config]
+default_to_workspace = false
+
+[env]
+BASE_BRANCH = "main"
+MERGE_BRANCH = ""
+RELEASE_BRANCH = ""
+COMMIT_MSG_FILE = ".git/COMMIT_EDITMSG"
+
+[tasks.default]
+alias = "release-status"
+
+[tasks.release-status]
+description = "Show release workflow status summary."
+dependencies = ["release-status-windows", "release-status-unix"]
+
+[tasks.release-status-windows]
+private = true
+condition = { platforms = ["windows"] }
+command = "pwsh"
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "status", "${BASE_BRANCH}"]
+
+[tasks.release-status-unix]
+private = true
+condition = { platforms = ["linux", "mac"] }
+command = "bash"
+args = ["scripts/workspace_release.sh", "status", "${BASE_BRANCH}"]
+
+[tasks.commit]
+description = "Stage all changes and build validated commit message."
+dependencies = ["commit-windows", "commit-unix"]
+
+[tasks.commit-windows]
+private = true
+condition = { platforms = ["windows"] }
+command = "pwsh"
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "commit"]
+
+[tasks.commit-unix]
+private = true
+condition = { platforms = ["linux", "mac"] }
+command = "bash"
+args = ["scripts/workspace_release.sh", "commit"]
+
+[tasks.push]
+description = "Push current branch commits with optional commit step."
+dependencies = ["push-windows", "push-unix"]
+
+[tasks.push-windows]
+private = true
+condition = { platforms = ["windows"] }
+command = "pwsh"
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "push"]
+
+[tasks.push-unix]
+private = true
+condition = { platforms = ["linux", "mac"] }
+command = "bash"
+args = ["scripts/workspace_release.sh", "push"]
+
+[tasks.pr]
+description = "Create pull request from current branch."
+dependencies = ["pr-windows", "pr-unix"]
+
+[tasks.pr-windows]
+private = true
+condition = { platforms = ["windows"] }
+command = "pwsh"
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "pr", "${BASE_BRANCH}"]
+
+[tasks.pr-unix]
+private = true
+condition = { platforms = ["linux", "mac"] }
+command = "bash"
+args = ["scripts/workspace_release.sh", "pr", "${BASE_BRANCH}"]
+
+[tasks.merge-pr]
+description = "Merge pull request for MERGE_BRANCH or current branch."
+dependencies = ["merge-pr-windows", "merge-pr-unix"]
+
+[tasks.merge-pr-windows]
+private = true
+condition = { platforms = ["windows"] }
+command = "pwsh"
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "merge-pr", "${MERGE_BRANCH}"]
+
+[tasks.merge-pr-unix]
+private = true
+condition = { platforms = ["linux", "mac"] }
+command = "bash"
+args = ["scripts/workspace_release.sh", "merge-pr", "${MERGE_BRANCH}"]
+
+[tasks.merge-release-pr]
+description = "Merge release pull request for RELEASE_BRANCH or current branch."
+dependencies = ["merge-release-pr-windows", "merge-release-pr-unix"]
+
+[tasks.merge-release-pr-windows]
+private = true
+condition = { platforms = ["windows"] }
+command = "pwsh"
+args = ["-NoProfile", "-File", "scripts/workspace_release.ps1", "merge-release-pr", "${RELEASE_BRANCH}"]
+
+[tasks.merge-release-pr-unix]
+private = true
+condition = { platforms = ["linux", "mac"] }
+command = "bash"
+args = ["scripts/workspace_release.sh", "merge-release-pr", "${RELEASE_BRANCH}"]
+
+[tasks.validate-commit-message]
+description = "Validate commit message from COMMIT_MSG_FILE."
+dependencies = ["validate-commit-message-windows", "validate-commit-message-unix"]
+
+[tasks.validate-commit-message-windows]
+private = true
+condition = { platforms = ["windows"] }
+command = "pwsh"
+args = ["-NoProfile", "-File", "scripts/validate_commit_msg.ps1", "${COMMIT_MSG_FILE}"]
+
+[tasks.validate-commit-message-unix]
+private = true
+condition = { platforms = ["linux", "mac"] }
+command = "bash"
+args = ["scripts/validate_commit_msg.sh", "${COMMIT_MSG_FILE}"]

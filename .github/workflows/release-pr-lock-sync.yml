@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   sync-lockfile:
-    if: ${{ startsWith(github.event.pull_request.title, 'chore: release') && github.event.pull_request.head.repo.full_name == github.repository }}
+    if: "${{ startsWith(github.event.pull_request.title, 'chore: release') && github.event.pull_request.head.repo.full_name == github.repository }}"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout release PR branch

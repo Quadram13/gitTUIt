@@ -2,6 +2,8 @@
 
 gitTUIt is a terminal UI for Git/Github workflows. I am currently using this for personal projects, as well as work tasks under specific conditions. The TUI works in it's current state for my purposes, but is still under development and may experience large/breaking changes, so use this at your own risk.
 
+At this stage, I have started adding release/version-control workflows to this repo. The end goal is to fold these scripts/cargo-make tasks into future plugins.
+
 ## Current Features
 
 - explicit repo tracking(requires local storage)
@@ -32,7 +34,12 @@ Currently, this TUI can replace(at least for me) the functionality of Github Des
 
 A concrete list of upcoming changes(in order):
 
-* changelog/packaging/release setup
+* changelog/packaging/release setup(in progress)
+    - basic workflow structure is in place
+    - remaining work:
+        * binary builds triggered by release tags
+        * installer packaging/publishing workflow
+        * post-release verification
 
 * plugin implementation
     - potential plugins for my current use include commit message building with conventional commits and merging release followup PRs from github actions
@@ -48,6 +55,7 @@ A concrete list of upcoming changes(in order):
     - evolve lifecycle model from queued/running/idle to include explicit success/error/cancelled states in one unified job registry
 
 * customization(themes, colors, syntax highlighting, keybinds)
+    - might be better to handle these through plugins as well
 
 These are changes/things I note that may not slot cleanly into the list:
 
@@ -85,6 +93,62 @@ Optional logging flags:
 - `-l` to print diagnostics (paths and tool versions) and exit.
 
 You can run from anywhere; repositories are explicitly added in-app.
+
+## Release Workflow
+
+This repo currently uses Release Please on `main` for the release flow:
+
+- `.github/workflows/release-please.yml`
+- `.github/workflows/release-pr-lock-sync.yml`
+- `release-please-config.json`
+- `.release-please-manifest.json`
+- `CHANGELOG.md`
+
+Current release component naming:
+
+- `gitTUIt` -> `gitTUIt-vX.Y.Z`
+
+### Commit Policy
+
+Commit header format:
+
+`<type>!: <description>` (or `<type>: <description>`)
+
+- Releasable types are `feat` and `fix`.
+- `!` (breaking marker) is allowed only on releasable types.
+- Non-releasable types are still valid and are grouped in changelog sections when a release is cut.
+- `feat`/`fix` entries are reserved for commits that include staged `src/` changes.
+- Commits without `src/` changes should use non-releasable types.
+
+Multi-entry commit format:
+
+- First entry is the commit subject.
+- Optional freeform paragraphs go in the body.
+- Additional change entries go at the end of the commit body as footer-style Conventional Commit lines.
+
+### cargo-make Tasks
+
+Install cargo-make if needed:
+
+```bash
+cargo install cargo-make
+```
+
+Release/task commands:
+
+```bash
+cargo make release-status
+cargo make commit
+cargo make push
+cargo make pr
+cargo make merge-pr
+cargo make merge-release-pr
+```
+
+Notes:
+
+- Hook installation requires manual setup (`git config core.hooksPath .githooks`).
+- Task scripts are available for both Windows PowerShell and Bash (macOS/Linux).
 
 ## Repository Tracking
 

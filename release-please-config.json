@@ -1,0 +1,22 @@
+{
+  "packages": {
+    ".": {
+      "component": "gitTUIt",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true,
+      "changelog-sections": [
+        { "type": "feat", "section": "Features" },
+        { "type": "fix", "section": "Tweaks/Bug Fixes" },
+        { "type": "docs", "section": "Documentation" },
+        { "type": "refactor", "section": "Refactoring" },
+        { "type": "perf", "section": "Performance" },
+        { "type": "build", "section": "Build System" },
+        { "type": "ci", "section": "CI" },
+        { "type": "test", "section": "Tests" },
+        { "type": "revert", "section": "Reverts" },
+        { "type": "chore", "section": "Chores" }
+      ]
+    }
+  }
+}

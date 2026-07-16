@@ -1,0 +1,21 @@
+{
+  "all_types": [
+    "feat",
+    "fix",
+    "docs",
+    "chore",
+    "refactor",
+    "test",
+    "build",
+    "ci",
+    "perf",
+    "revert"
+  ],
+  "releasable_types": [
+    "feat",
+    "fix"
+  ],
+  "src_prefixes": [
+    "src/"
+  ]
+}

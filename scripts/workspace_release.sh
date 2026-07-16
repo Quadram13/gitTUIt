@@ -226,6 +226,8 @@ pr_workflow() {
   ensure_command git
   ensure_command gh
   local base_branch="${1:-main}"
+  push_workflow
+
   local branch
   branch="$(get_current_branch)"
   [[ "$branch" != "HEAD" ]] || {
@@ -239,6 +241,16 @@ pr_workflow() {
 
   ensure_branch_upstream "$branch"
   ensure_clean_working_tree
+
+  local existing_state
+  existing_state="$(gh pr view "$branch" --json state --jq '.state' 2>/dev/null || true)"
+  if [[ "$existing_state" == "OPEN" ]]; then
+    local existing_url existing_number
+    existing_url="$(gh pr view "$branch" --json url --jq '.url')"
+    existing_number="$(gh pr view "$branch" --json number --jq '.number')"
+    echo "PR already exists for '$branch': #$existing_number $existing_url"
+    return 0
+  fi
 
   local records_file
   records_file="$(mktemp)"
@@ -388,11 +400,21 @@ merge_pr_workflow() {
   ensure_command gh
   local branch="${1:-}"
   local expect_release="${2:-false}"
+  local base_branch="${3:-main}"
+  local current_branch
+  current_branch="$(get_current_branch)"
   [[ -n "${branch// }" ]] || branch="$(get_current_branch)"
   [[ "$branch" != "HEAD" ]] || {
     echo "Detached HEAD state detected. Checkout a branch first." >&2
     exit 1
   }
+  [[ "$current_branch" == "$branch" ]] || {
+    echo "Current branch '$current_branch' does not match requested merge branch '$branch'. Checkout '$branch' and rerun so pr->merge chaining targets the same branch." >&2
+    exit 1
+  }
+
+  pr_workflow "$base_branch"
+  branch="$(get_current_branch)"
 
   local is_release="false"
   if is_release_pr_branch "$branch"; then
@@ -454,8 +476,8 @@ main() {
     commit) commit_workflow ;;
     push) push_workflow ;;
     pr) pr_workflow "${1:-main}" ;;
-    merge-pr) merge_pr_workflow "${1:-}" "false" ;;
-    merge-release-pr) merge_pr_workflow "${1:-}" "true" ;;
+    merge-pr) merge_pr_workflow "${1:-}" "false" "${2:-main}" ;;
+    merge-release-pr) merge_pr_workflow "${1:-}" "true" "${2:-main}" ;;
     status) release_status_workflow "${1:-main}" ;;
     *)
       echo "Unknown command '$command'. Use: commit, push, pr, merge-pr, merge-release-pr, status." >&2

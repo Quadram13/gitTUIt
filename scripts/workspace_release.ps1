@@ -371,6 +371,8 @@ function PullRequest-Workflow([string]$BaseBranch) {
     Ensure-Command "gh"
     $policy = Get-CommitPolicy
 
+    Push-Workflow
+
     $branch = Get-CurrentBranch
     if ($branch -eq "HEAD") {
         throw "Detached HEAD state detected. Checkout a branch first."
@@ -381,6 +383,15 @@ function PullRequest-Workflow([string]$BaseBranch) {
 
     Ensure-BranchUpstream -Branch $branch
     Ensure-CleanWorkingTree
+
+    & gh pr view $branch --json number,state,url,title *> $null
+    if ($LASTEXITCODE -eq 0) {
+        $existing = (& gh pr view $branch --json number,state,url,title | ConvertFrom-Json)
+        if ("$($existing.state)" -eq "OPEN") {
+            Write-Host "PR already exists for '$branch': #$($existing.number) $($existing.url)" -ForegroundColor Cyan
+            return
+        }
+    }
 
     $commits = @(Get-CommitRecordsSinceBase -Branch $branch -BaseBranch $BaseBranch -Policy $policy)
     if ($commits.Count -eq 0) {
@@ -466,15 +477,22 @@ function Test-IsReleasePullRequest($Pr) {
     return $title -match '^chore:\s+release\b'
 }
 
-function Merge-PullRequestFlow([string]$Branch, [bool]$ExpectReleasePr = $false) {
+function Merge-PullRequestFlow([string]$Branch, [bool]$ExpectReleasePr = $false, [string]$BaseBranch = "main") {
     Ensure-Command "git"
     Ensure-Command "gh"
+    $currentBranch = Get-CurrentBranch
     if ([string]::IsNullOrWhiteSpace($Branch)) {
-        $Branch = Get-CurrentBranch
+        $Branch = $currentBranch
     }
     if ($Branch -eq "HEAD") {
         throw "Detached HEAD state detected. Checkout a branch first."
     }
+    if ($currentBranch -ne $Branch) {
+        throw "Current branch '$currentBranch' does not match requested merge branch '$Branch'. Checkout '$Branch' and rerun so pr->merge chaining targets the same branch."
+    }
+
+    PullRequest-Workflow -BaseBranch $BaseBranch
+    $Branch = Get-CurrentBranch
 
     $pr = Get-PullRequestMetadata -Branch $Branch
     $isReleasePr = Test-IsReleasePullRequest -Pr $pr
@@ -554,17 +572,25 @@ switch ($command) {
     }
     "merge-pr" {
         $branch = ""
+        $base = "main"
         if ($args.Count -ge 2) {
             $branch = $args[1].Trim()
         }
-        Merge-PullRequestFlow -Branch $branch -ExpectReleasePr:$false
+        if ($args.Count -ge 3) {
+            $base = $args[2].Trim()
+        }
+        Merge-PullRequestFlow -Branch $branch -ExpectReleasePr:$false -BaseBranch $base
     }
     "merge-release-pr" {
         $branch = ""
+        $base = "main"
         if ($args.Count -ge 2) {
             $branch = $args[1].Trim()
         }
-        Merge-PullRequestFlow -Branch $branch -ExpectReleasePr:$true
+        if ($args.Count -ge 3) {
+            $base = $args[2].Trim()
+        }
+        Merge-PullRequestFlow -Branch $branch -ExpectReleasePr:$true -BaseBranch $base
     }
     "status" {
         $base = "main"

@@ -84,9 +84,14 @@ ensure_clean_working_tree() {
   fi
 }
 
+branch_has_upstream() {
+  local branch="$1"
+  git rev-parse --abbrev-ref --symbolic-full-name "${branch}@{upstream}" >/dev/null 2>&1
+}
+
 ensure_branch_upstream() {
   local branch="$1"
-  if ! git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+  if ! branch_has_upstream "$branch"; then
     echo "No upstream configured for '$branch'. Pushing with upstream tracking..."
     git push -u origin "$branch"
   fi
@@ -194,7 +199,7 @@ push_workflow() {
   }
 
   if [[ -n "$(get_working_tree_changes)" ]]; then
-    if prompt_yes_no "Uncommitted changes found. Run commit task before push?" "true"; then
+    if prompt_yes_no "Uncommitted changes found. Run commit task before push?" "false"; then
       commit_workflow
       if ! prompt_yes_no "Commit step finished. Continue to push step?" "false"; then
         echo "Stopping after commit step by user request."
@@ -206,9 +211,10 @@ push_workflow() {
     fi
   fi
 
-  if git rev-parse --abbrev-ref --symbolic-full-name "@{u}" >/dev/null 2>&1; then
+  if branch_has_upstream "$branch"; then
     git push
   else
+    echo "No upstream configured for '$branch'. Pushing with upstream tracking..."
     git push -u origin "$branch"
   fi
 }
@@ -328,14 +334,19 @@ pr_workflow() {
   done
 
   local selected selected_index=-1 i
-  selected="$(prompt_menu_selection "Select PR title change entry" "${options[@]}")"
-  for ((i=0; i<${#options[@]}; i++)); do
-    [[ "${options[$i]}" == "$selected" ]] && selected_index=$i && break
-  done
-  (( selected_index >= 0 )) || {
-    echo "Could not resolve selected title entry." >&2
-    exit 1
-  }
+  if (( ${#entry_rows[@]} == 1 )); then
+    selected_index=0
+    echo "Only one change entry found; using it as PR title: ${entry_rows[0]#*$'\t'}"
+  else
+    selected="$(prompt_menu_selection "Select PR title change entry" "${options[@]}")"
+    for ((i=0; i<${#options[@]}; i++)); do
+      [[ "${options[$i]}" == "$selected" ]] && selected_index=$i && break
+    done
+    (( selected_index >= 0 )) || {
+      echo "Could not resolve selected title entry." >&2
+      exit 1
+    }
+  fi
 
   local selected_hash selected_title
   selected_hash="${entry_rows[$selected_index]%%$'\t'*}"

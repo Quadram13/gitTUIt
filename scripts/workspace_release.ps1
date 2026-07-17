@@ -97,11 +97,15 @@ function Ensure-CleanWorkingTree {
     }
 }
 
+function Test-BranchHasUpstream([string]$Branch) {
+    Ensure-Command "git"
+    & git rev-parse --abbrev-ref --symbolic-full-name "$Branch@{upstream}" *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
 function Ensure-BranchUpstream([string]$Branch) {
     Ensure-Command "git"
-    try {
-        $null = & git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>$null
-    } catch {
+    if (-not (Test-BranchHasUpstream -Branch $Branch)) {
         Write-Host "No upstream configured for '$Branch'. Pushing with upstream tracking..." -ForegroundColor Yellow
         & git push -u origin $Branch
         if ($LASTEXITCODE -ne 0) {
@@ -223,7 +227,7 @@ function Push-Workflow {
 
     $changes = @(Get-WorkingTreeChanges)
     if ($changes.Count -gt 0) {
-        if (Prompt-YesNo -Question "Uncommitted changes found. Run commit task before push?" -DefaultNo $true) {
+        if (Prompt-YesNo -Question "Uncommitted changes found. Run commit task before push?" -DefaultNo $false) {
             Commit-Workflow
             if (-not (Prompt-YesNo -Question "Commit step finished. Continue to push step?" -DefaultNo $false)) {
                 Write-Host "Stopping after commit step by user request." -ForegroundColor Yellow
@@ -234,10 +238,10 @@ function Push-Workflow {
         }
     }
 
-    try {
-        $null = & git rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>$null
+    if (Test-BranchHasUpstream -Branch $branch) {
         & git push
-    } catch {
+    } else {
+        Write-Host "No upstream configured for '$branch'. Pushing with upstream tracking..." -ForegroundColor Yellow
         & git push -u origin $branch
     }
     if ($LASTEXITCODE -ne 0) {
@@ -312,12 +316,18 @@ function Prompt-SelectTitleEntry($Commits) {
         throw "No change entries were discovered from branch commits."
     }
 
+    $items = @($flattened.ToArray())
+    if ($items.Count -eq 1) {
+        Write-Host "Only one change entry found; using it as PR title: $($items[0].Raw)" -ForegroundColor Cyan
+        return $items[0]
+    }
+
     $options = @()
-    foreach ($item in @($flattened.ToArray())) {
+    foreach ($item in $items) {
         $options += $item.Display
     }
     $selected = Prompt-MenuSelection -Title "Select PR title change entry" -Options $options
-    foreach ($item in @($flattened.ToArray())) {
+    foreach ($item in $items) {
         if ($item.Display -eq $selected) {
             return $item
         }

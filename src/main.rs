@@ -1,3 +1,4 @@
+// testing status checks for release
 mod app;
 mod diagnostics;
 mod git;

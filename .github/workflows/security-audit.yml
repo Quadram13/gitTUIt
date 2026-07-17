@@ -1,9 +1,7 @@
 name: Security Audit
 
 on:
-  pull_request:
-    branches:
-      - main
+  # Temporarily disabled for PRs while branch protection/ruleset checks are reset.
   workflow_dispatch:
 
 permissions:

@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=./commit_policy.sh
 source "${SCRIPT_DIR}/commit_policy.sh"
+WORKFLOW_STOPPED="false"
 
 ensure_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -183,6 +184,7 @@ commit_workflow() {
 }
 
 push_workflow() {
+  WORKFLOW_STOPPED="false"
   ensure_command git
   local branch
   branch="$(get_current_branch)"
@@ -194,6 +196,11 @@ push_workflow() {
   if [[ -n "$(get_working_tree_changes)" ]]; then
     if prompt_yes_no "Uncommitted changes found. Run commit task before push?" "true"; then
       commit_workflow
+      if ! prompt_yes_no "Commit step finished. Continue to push step?" "false"; then
+        echo "Stopping after commit step by user request."
+        WORKFLOW_STOPPED="true"
+        return 0
+      fi
     else
       echo "Leaving uncommitted changes untouched; pushing existing commits only."
     fi
@@ -223,10 +230,19 @@ load_commit_records_since_base() {
 }
 
 pr_workflow() {
+  WORKFLOW_STOPPED="false"
   ensure_command git
   ensure_command gh
   local base_branch="${1:-main}"
   push_workflow
+  if [[ "$WORKFLOW_STOPPED" == "true" ]]; then
+    return 0
+  fi
+  if ! prompt_yes_no "Push step finished. Continue to PR creation/reuse step?" "false"; then
+    echo "Stopping after push step by user request."
+    WORKFLOW_STOPPED="true"
+    return 0
+  fi
 
   local branch
   branch="$(get_current_branch)"
@@ -388,6 +404,41 @@ assert_pr_ready_for_merge() {
   fi
 }
 
+wait_required_checks_for_merge() {
+  local branch="$1"
+  local sleep_seconds="${2:-30}"
+  while true; do
+    local state
+    state="$(gh pr view "$branch" --json state --jq '.state')"
+    [[ "$state" == "OPEN" ]] || {
+      echo "PR for '$branch' is not open." >&2
+      exit 1
+    }
+
+    local merge_state
+    merge_state="$(gh pr view "$branch" --json mergeStateStatus --jq '.mergeStateStatus')"
+    case "$merge_state" in
+      DIRTY|DRAFT|UNKNOWN|BEHIND)
+        echo "PR for '$branch' is not merge-ready (mergeStateStatus=$merge_state)." >&2
+        exit 1
+        ;;
+    esac
+
+    local checks_output
+    if checks_output="$(gh pr checks "$branch" --required 2>&1)"; then
+      return 0
+    fi
+
+    echo "Required checks are not ready yet:"
+    echo "$checks_output"
+    if ! prompt_yes_no "Wait ${sleep_seconds}s and recheck required checks?" "false"; then
+      echo "Aborted merge before required checks were ready." >&2
+      exit 1
+    fi
+    sleep "$sleep_seconds"
+  done
+}
+
 is_release_pr_branch() {
   local branch="$1"
   local title
@@ -396,6 +447,7 @@ is_release_pr_branch() {
 }
 
 merge_pr_workflow() {
+  WORKFLOW_STOPPED="false"
   ensure_command git
   ensure_command gh
   local branch="${1:-}"
@@ -414,6 +466,14 @@ merge_pr_workflow() {
   }
 
   pr_workflow "$base_branch"
+  if [[ "$WORKFLOW_STOPPED" == "true" ]]; then
+    echo "Stopping before merge step by user request."
+    return 0
+  fi
+  if ! prompt_yes_no "PR step finished. Continue to merge step?" "false"; then
+    echo "Stopping before merge step by user request."
+    return 0
+  fi
   branch="$(get_current_branch)"
 
   local is_release="false"
@@ -429,7 +489,11 @@ merge_pr_workflow() {
     exit 1
   fi
 
-  assert_pr_ready_for_merge "$branch"
+  if [[ "$expect_release" == "true" ]]; then
+    assert_pr_ready_for_merge "$branch"
+  else
+    wait_required_checks_for_merge "$branch"
+  fi
   local args=("$branch" "--merge")
   if prompt_yes_no "Delete branch after merge?" "true"; then
     args+=("--delete-branch")

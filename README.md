@@ -149,6 +149,8 @@ Notes:
 
 - Hook installation requires manual setup (`git config core.hooksPath .githooks`).
 - Task scripts are available for both Windows PowerShell and Bash (macOS/Linux).
+- Chained tasks now prompt after each step finishes before moving to the next step (push -> PR -> merge).
+- `merge-pr` waits/retries on required checks only; optional checks no longer cause one-shot merge gating failures.
 
 ### Security Audit
 

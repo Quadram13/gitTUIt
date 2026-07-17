@@ -225,6 +225,10 @@ function Push-Workflow {
     if ($changes.Count -gt 0) {
         if (Prompt-YesNo -Question "Uncommitted changes found. Run commit task before push?" -DefaultNo $true) {
             Commit-Workflow
+            if (-not (Prompt-YesNo -Question "Commit step finished. Continue to push step?" -DefaultNo $false)) {
+                Write-Host "Stopping after commit step by user request." -ForegroundColor Yellow
+                return $false
+            }
         } else {
             Write-Host "Leaving uncommitted changes untouched; pushing existing commits only." -ForegroundColor Yellow
         }
@@ -239,6 +243,7 @@ function Push-Workflow {
     if ($LASTEXITCODE -ne 0) {
         throw "Push failed."
     }
+    return $true
 }
 
 function Get-CommitRecordsSinceBase([string]$Branch, [string]$BaseBranch, [hashtable]$Policy) {
@@ -371,7 +376,14 @@ function PullRequest-Workflow([string]$BaseBranch) {
     Ensure-Command "gh"
     $policy = Get-CommitPolicy
 
-    Push-Workflow
+    $pushStepCompleted = Push-Workflow
+    if (-not $pushStepCompleted) {
+        return $false
+    }
+    if (-not (Prompt-YesNo -Question "Push step finished. Continue to PR creation/reuse step?" -DefaultNo $false)) {
+        Write-Host "Stopping after push step by user request." -ForegroundColor Yellow
+        return $false
+    }
 
     $branch = Get-CurrentBranch
     if ($branch -eq "HEAD") {
@@ -389,7 +401,7 @@ function PullRequest-Workflow([string]$BaseBranch) {
         $existing = (& gh pr view $branch --json number,state,url,title | ConvertFrom-Json)
         if ("$($existing.state)" -eq "OPEN") {
             Write-Host "PR already exists for '$branch': #$($existing.number) $($existing.url)" -ForegroundColor Cyan
-            return
+            return $true
         }
     }
 
@@ -405,6 +417,7 @@ function PullRequest-Workflow([string]$BaseBranch) {
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to create pull request via GitHub CLI."
     }
+    return $true
 }
 
 function Assert-PrReadyForMerge([string]$Branch) {
@@ -423,43 +436,45 @@ function Assert-PrReadyForMerge([string]$Branch) {
         throw "PR #$($pr.number) is not merge-ready (mergeStateStatus=$mergeState). Resolve PR readiness checks and retry."
     }
 
-    $failed = New-Object System.Collections.Generic.List[string]
-    $pending = New-Object System.Collections.Generic.List[string]
-    foreach ($item in @($pr.statusCheckRollup)) {
-        $name = "$($item.name)"
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = "$($item.context)"
+    $requiredChecksOutput = @(& gh pr checks $Branch --required 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+        $joined = ($requiredChecksOutput -join [Environment]::NewLine).Trim()
+        if ([string]::IsNullOrWhiteSpace($joined)) {
+            $joined = "(no additional output from gh pr checks)"
         }
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = "unnamed-check"
-        }
-        $state = "$($item.conclusion)"
-        if ([string]::IsNullOrWhiteSpace($state)) {
-            $state = "$($item.status)"
-        }
-        if ([string]::IsNullOrWhiteSpace($state)) {
-            $state = "$($item.state)"
-        }
-        $normalized = $state.ToUpperInvariant()
-        if ($normalized -in @("SUCCESS", "NEUTRAL", "SKIPPED", "EXPECTED")) {
-            continue
-        }
-        if ($normalized -in @("PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED")) {
-            $pending.Add($name) | Out-Null
-        } else {
-            $failed.Add("$name ($normalized)") | Out-Null
-        }
+        throw "PR #$($pr.number) required checks are not ready. This task fails one-shot for release merges. Details:`n$joined"
     }
+}
 
-    if ($failed.Count -gt 0 -or $pending.Count -gt 0) {
-        $messages = New-Object System.Collections.Generic.List[string]
-        if ($failed.Count -gt 0) {
-            $messages.Add("failing checks: $($failed -join ', ')") | Out-Null
+function Wait-RequiredChecksForMerge([string]$Branch, [int]$SleepSeconds = 30) {
+    Ensure-Command "gh"
+    while ($true) {
+        $pr = Get-PullRequestMetadata -Branch $Branch
+        if ("$($pr.state)" -ne "OPEN") {
+            throw "PR for '$Branch' is not open."
         }
-        if ($pending.Count -gt 0) {
-            $messages.Add("pending checks: $($pending -join ', ')") | Out-Null
+
+        $mergeState = "$($pr.mergeStateStatus)".ToUpperInvariant()
+        if ($mergeState -in @("DIRTY", "DRAFT", "UNKNOWN", "BEHIND")) {
+            throw "PR #$($pr.number) is not merge-ready (mergeStateStatus=$mergeState). Resolve PR readiness and retry."
         }
-        throw "PR #$($pr.number) is not ready to merge ($($messages -join '; ')). This task fails one-shot; rerun after checks pass."
+
+        $requiredChecksOutput = @(& gh pr checks $Branch --required 2>&1)
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+
+        $joined = ($requiredChecksOutput -join [Environment]::NewLine).Trim()
+        if ([string]::IsNullOrWhiteSpace($joined)) {
+            $joined = "(no additional output from gh pr checks)"
+        }
+        Write-Host "Required checks are not ready yet for PR #$($pr.number):" -ForegroundColor Yellow
+        Write-Host $joined -ForegroundColor Yellow
+
+        if (-not (Prompt-YesNo -Question "Wait $SleepSeconds seconds and recheck required checks?" -DefaultNo $false)) {
+            throw "Aborted merge before required checks were ready."
+        }
+        Start-Sleep -Seconds $SleepSeconds
     }
 }
 
@@ -491,7 +506,15 @@ function Merge-PullRequestFlow([string]$Branch, [bool]$ExpectReleasePr = $false,
         throw "Current branch '$currentBranch' does not match requested merge branch '$Branch'. Checkout '$Branch' and rerun so pr->merge chaining targets the same branch."
     }
 
-    PullRequest-Workflow -BaseBranch $BaseBranch
+    $prStepCompleted = PullRequest-Workflow -BaseBranch $BaseBranch
+    if (-not $prStepCompleted) {
+        Write-Host "Stopping before merge step by user request." -ForegroundColor Yellow
+        return
+    }
+    if (-not (Prompt-YesNo -Question "PR step finished. Continue to merge step?" -DefaultNo $false)) {
+        Write-Host "Stopping before merge step by user request." -ForegroundColor Yellow
+        return
+    }
     $Branch = Get-CurrentBranch
 
     $pr = Get-PullRequestMetadata -Branch $Branch
@@ -503,7 +526,11 @@ function Merge-PullRequestFlow([string]$Branch, [bool]$ExpectReleasePr = $false,
         throw "Branch '$Branch' points to a release PR. Use merge-release-pr instead."
     }
 
-    Assert-PrReadyForMerge -Branch $Branch
+    if ($ExpectReleasePr) {
+        Assert-PrReadyForMerge -Branch $Branch
+    } else {
+        Wait-RequiredChecksForMerge -Branch $Branch
+    }
     $mergeArgs = @($Branch, "--merge")
     if (Prompt-YesNo -Question "Delete branch after merge?" -DefaultNo $true) {
         $mergeArgs += "--delete-branch"
@@ -561,14 +588,14 @@ switch ($command) {
         Commit-Workflow
     }
     "push" {
-        Push-Workflow
+        $null = Push-Workflow
     }
     "pr" {
         $base = "main"
         if ($args.Count -ge 2) {
             $base = $args[1]
         }
-        PullRequest-Workflow -BaseBranch $base
+        $null = PullRequest-Workflow -BaseBranch $base
     }
     "merge-pr" {
         $branch = ""

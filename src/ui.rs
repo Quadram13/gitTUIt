@@ -152,11 +152,7 @@ fn draw_repo_picker(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Main Menu"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("Main Menu"))
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
@@ -194,11 +190,7 @@ fn draw_repo_browser(frame: &mut Frame, app: &App, area: Rect) {
             .collect()
     };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Repo Browser"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("Repo Browser"))
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
@@ -234,11 +226,7 @@ fn draw_branch_picker(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Branches"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("Branches"))
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
@@ -457,11 +445,7 @@ fn draw_stash_view(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Stash"),
-        )
+        .block(Block::default().borders(Borders::ALL).title("Stash"))
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("> ");
 
@@ -472,7 +456,11 @@ fn draw_stash_view(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_stateful_widget(list, columns[0], &mut state);
 
     let details = Paragraph::new(app.preview_text())
-        .block(Block::default().borders(Borders::ALL).title("Stash Details"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Stash Details"),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(details, columns[1]);
 }
@@ -573,7 +561,11 @@ fn draw_staged(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_preview(frame: &mut Frame, app: &App, area: Rect) {
     let preview = Paragraph::new(diff_colored_text(&app.preview_text()))
-        .block(Block::default().borders(Borders::ALL).title("Preview / Output"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Preview / Output"),
+        )
         .wrap(Wrap { trim: false });
     frame.render_widget(preview, area);
 }
@@ -672,7 +664,10 @@ fn draw_fullscreen_diff(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn diff_colored_text(input: &str) -> Text<'static> {
-    let lines = input.lines().map(|line| colorize_diff_line(line.to_string())).collect::<Vec<_>>();
+    let lines = input
+        .lines()
+        .map(|line| colorize_diff_line(line.to_string()))
+        .collect::<Vec<_>>();
     Text::from(lines)
 }
 
@@ -726,11 +721,7 @@ fn draw_commit_popup(frame: &mut Frame, app: &App) {
             scroll_y.min(u16::MAX as usize) as u16,
             scroll_x.min(u16::MAX as usize) as u16,
         ))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title),
-        );
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(input, popup);
 }
 
@@ -834,15 +825,10 @@ fn draw_help_popup(frame: &mut Frame, app: &App) {
     };
     let help = Paragraph::new(app.help_popup_body())
         .scroll((app.help_scroll.min(u16::MAX as usize) as u16, 0))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     frame.render_widget(help, popup);
 }
-
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     let vertical = Layout::default()

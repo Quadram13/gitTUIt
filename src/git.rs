@@ -3,7 +3,12 @@ mod history;
 mod prs;
 mod stash;
 
-use std::{ffi::OsString, path::Path, process::Command, time::Instant};
+use std::{
+    ffi::OsString,
+    path::Path,
+    process::{Command, ExitStatus},
+    time::Instant,
+};
 
 use anyhow::{Context, Result, anyhow};
 use log::{debug, error};
@@ -13,8 +18,8 @@ pub use branches::{
     list_local_branches, list_remote_branches, switch_branch,
 };
 pub use history::{
-    CommitDetails, CommitEntry, TrackingCommitSummary, cherry_pick, cherry_pick_abort,
-    cherry_pick_continue, checkout_detached, commit_details_structured, commit_file_diff,
+    CommitDetails, CommitEntry, TrackingCommitSummary, checkout_detached, cherry_pick,
+    cherry_pick_abort, cherry_pick_continue, commit_details_structured, commit_file_diff,
     commit_history, file_history, tracking_commit_summary,
 };
 pub use prs::{
@@ -43,11 +48,7 @@ pub struct RepoSnapshot {
 }
 
 pub fn snapshot(repo_root: &Path) -> Result<RepoSnapshot> {
-    let raw = run_command(
-        "git",
-        ["status", "--porcelain=1", "--branch"],
-        repo_root,
-    )?;
+    let raw = run_command("git", ["status", "--porcelain=1", "--branch"], repo_root)?;
     parse_status(&raw)
 }
 
@@ -94,7 +95,26 @@ pub fn commit(repo_root: &Path, subject: &str, body: Option<&str>) -> Result<()>
             args.extend(["-m", body_text]);
         }
     }
-    run_command("git", args, repo_root).map(|_| ())
+    let output = run_command_capture("git", args, repo_root)?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    Err(anyhow!(format_commit_failure(&output)))
+}
+
+pub fn unresolved_conflict_files(repo_root: &Path) -> Result<Vec<String>> {
+    let raw = run_command(
+        "git",
+        ["diff", "--name-only", "--diff-filter=U"],
+        repo_root,
+    )?;
+    Ok(raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
 pub fn fetch(repo_root: &Path) -> Result<()> {
@@ -126,6 +146,30 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<std::ffi::OsStr>,
 {
+    let output = run_command_capture(program, args, cwd)?;
+    if output.status.success() {
+        return Ok(output.stdout);
+    }
+
+    let redacted_stderr = redact_sensitive_text(&output.stderr);
+    Err(anyhow!(
+        "{program} failed with status {}: {}",
+        output.status,
+        redacted_stderr
+    ))
+}
+
+struct CommandCapture {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_command_capture<I, S>(program: &str, args: I, cwd: &Path) -> Result<CommandCapture>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let args_vec: Vec<OsString> = args
         .into_iter()
         .map(|arg| arg.as_ref().to_os_string())
@@ -150,33 +194,97 @@ where
         .output()
         .with_context(|| format!("Failed to execute {program}"))?;
     let elapsed_ms = started.elapsed().as_millis();
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if output.status.success() {
         debug!(
             "Command succeeded in {}ms (status={}): {} {}",
-            elapsed_ms,
-            output.status,
-            program,
-            redacted_args_display
+            elapsed_ms, output.status, program, redacted_args_display
         );
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(CommandCapture {
+            status: output.status,
+            stdout,
+            stderr,
+        })
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let redacted_stdout = redact_sensitive_text(&stdout);
         let redacted_stderr = redact_sensitive_text(&stderr);
         error!(
-            "Command failed in {}ms (status={}): {} {} | stderr: {}",
+            "Command failed in {}ms (status={}): {} {} | stdout: {} | stderr: {}",
             elapsed_ms,
             output.status,
             program,
             redacted_args_display,
+            redacted_stdout.trim(),
             redacted_stderr.trim()
         );
-        Err(anyhow!(
-            "{program} failed with status {}: {}",
-            output.status,
-            redacted_stderr
-        ))
+        Ok(CommandCapture {
+            status: output.status,
+            stdout,
+            stderr,
+        })
     }
+}
+
+fn format_commit_failure(output: &CommandCapture) -> String {
+    let combined = [output.stderr.as_str(), output.stdout.as_str()]
+        .iter()
+        .filter(|text| !text.trim().is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lower = combined.to_ascii_lowercase();
+    let tail = output_tail(&combined, 10);
+
+    if lower.contains("unmerged files")
+        || lower.contains("completing the merge")
+        || lower.contains("you have not concluded your merge")
+    {
+        return "Cannot commit: unresolved merge conflicts detected. Resolve conflicts, stage files, then retry.".to_string();
+    }
+
+    if looks_like_hook_failure(&lower) {
+        if tail.is_empty() {
+            return "Commit blocked by git hooks. No hook output was captured.".to_string();
+        }
+        return format!("Commit blocked by git hooks. Recent output:\n{tail}");
+    }
+
+    if tail.is_empty() {
+        return format!("git commit failed with status {}", output.status);
+    }
+
+    format!(
+        "git commit failed with status {}. Recent output:\n{}",
+        output.status, tail
+    )
+}
+
+fn looks_like_hook_failure(lower_output: &str) -> bool {
+    [
+        "pre-commit hook",
+        "commit-msg hook",
+        "hook declined",
+        "hook failed",
+        "husky - ",
+    ]
+    .iter()
+    .any(|needle| lower_output.contains(needle))
+}
+
+fn output_tail(raw: &str, max_lines: usize) -> String {
+    if raw.trim().is_empty() || max_lines == 0 {
+        return String::new();
+    }
+    let sanitized = redact_sensitive_text(raw);
+    let lines: Vec<&str> = sanitized.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..]
+        .iter()
+        .map(|line| line.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn redact_sensitive_text(input: &str) -> String {

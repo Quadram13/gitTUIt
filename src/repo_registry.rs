@@ -41,7 +41,8 @@ impl RepoRegistry {
                 .with_context(|| format!("Failed creating {}", parent.display()))?;
         }
 
-        let serialized = serde_json::to_string_pretty(self).context("Failed serializing repo registry")?;
+        let serialized =
+            serde_json::to_string_pretty(self).context("Failed serializing repo registry")?;
         fs::write(&file_path, serialized)
             .with_context(|| format!("Failed writing {}", file_path.display()))?;
         Ok(())
@@ -59,7 +60,9 @@ impl RepoRegistry {
             return Ok(canonical);
         }
 
-        self.repos.push(TrackedRepo { path: canonical_str });
+        self.repos.push(TrackedRepo {
+            path: canonical_str,
+        });
         self.repos.sort_by(|a, b| a.path.cmp(&b.path));
         self.save()?;
         Ok(canonical)

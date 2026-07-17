@@ -12,7 +12,8 @@ impl App {
         }
         self.screen = Screen::StashView;
         self.refresh_stash_entries()?;
-        self.status_message = "Stash view: [s] stash current changes, [a]/[p]/[d] apply/pop/drop".to_string();
+        self.status_message =
+            "Stash view: [s] stash current changes, [a]/[p]/[d] apply/pop/drop".to_string();
         Ok(())
     }
 
@@ -22,9 +23,11 @@ impl App {
             return Ok(());
         }
         let root = self.current_repo_root()?.to_path_buf();
-        self.request_write_op("Stashing current changes", super::AsyncWriteOp::StashPush, move || {
-            git::stash_push(&root)
-        });
+        self.request_write_op(
+            "Stashing current changes",
+            super::AsyncWriteOp::StashPush,
+            move || git::stash_push(&root),
+        );
         Ok(())
     }
 
@@ -106,14 +109,16 @@ impl App {
         self.stash_details_inflight = Some(request_id);
         self.set_async_running_status(&format!("Loading stash details {}", reference));
         let tx = self.async_tx.clone();
-        if let Err(err) = self.queue_cancellable_async_task(JOB_STASH_DETAILS, request_id, move || {
-            let details = git::stash_show(&root, &reference).map_err(|err| err.to_string());
-            let _ = tx.send(AppAsyncEvent::StashDetailsReady {
-                request_id,
-                reference,
-                details,
-            });
-        }) {
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_STASH_DETAILS, request_id, move || {
+                let details = git::stash_show(&root, &reference).map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::StashDetailsReady {
+                    request_id,
+                    reference,
+                    details,
+                });
+            })
+        {
             self.stash_details_inflight = None;
             return Err(err);
         }
@@ -126,13 +131,15 @@ impl App {
         let request_id = self.stash_entries_request_seq;
         self.stash_entries_inflight = Some(request_id);
         let tx = self.async_tx.clone();
-        if let Err(err) = self.queue_cancellable_async_task(JOB_STASH_ENTRIES, request_id, move || {
-            let entries = git::list_stashes(&root).map_err(|err| err.to_string());
-            let _ = tx.send(AppAsyncEvent::StashEntriesReady {
-                request_id,
-                entries,
-            });
-        }) {
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_STASH_ENTRIES, request_id, move || {
+                let entries = git::list_stashes(&root).map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::StashEntriesReady {
+                    request_id,
+                    entries,
+                });
+            })
+        {
             self.stash_entries_inflight = None;
             return Err(err);
         }

@@ -1180,6 +1180,24 @@ impl App {
             self.status_message = "Stage files before committing".to_string();
             return;
         }
+        let root = match self.current_repo_root() {
+            Ok(path) => path.to_path_buf(),
+            Err(err) => {
+                self.status_message = format!("Unable to open repository for commit: {err}");
+                return;
+            }
+        };
+        match git::unresolved_conflict_files(&root) {
+            Ok(conflicts) if !conflicts.is_empty() => {
+                self.status_message = unresolved_conflicts_status(&conflicts);
+                return;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.status_message = format!("Unable to check merge conflicts: {err}");
+                return;
+            }
+        }
         self.pending_commit_subject = None;
         self.input_mode = InputMode::CommitSubject;
         self.input_buffer.clear();
@@ -2707,6 +2725,9 @@ impl App {
                         (AsyncWriteOp::OpenPrInBrowser { number }, Ok(())) => {
                             self.status_message = format!("Opened PR #{} in browser", number);
                         }
+                        (AsyncWriteOp::Commit, Err(err)) => {
+                            self.status_message = err;
+                        }
                         (AsyncWriteOp::StageFile { .. }, Err(err))
                         | (AsyncWriteOp::UnstageFile { .. }, Err(err))
                         | (AsyncWriteOp::StageAll { .. }, Err(err))
@@ -2720,7 +2741,6 @@ impl App {
                         | (AsyncWriteOp::SwitchBranch { .. }, Err(err))
                         | (AsyncWriteOp::CheckoutRemoteBranch { .. }, Err(err))
                         | (AsyncWriteOp::CreateBranch { .. }, Err(err))
-                        | (AsyncWriteOp::Commit, Err(err))
                         | (AsyncWriteOp::StashPush, Err(err))
                         | (AsyncWriteOp::StashApply { .. }, Err(err))
                         | (AsyncWriteOp::StashPop { .. }, Err(err))
@@ -3520,6 +3540,33 @@ fn pull_request_merge_method_label(method: GitPullRequestMergeMethod) -> &'stati
         GitPullRequestMergeMethod::Squash => "squash",
         GitPullRequestMergeMethod::Rebase => "rebase",
     }
+}
+
+fn unresolved_conflicts_status(conflicts: &[String]) -> String {
+    const MAX_LISTED: usize = 3;
+    let total = conflicts.len();
+    let listed = conflicts
+        .iter()
+        .take(MAX_LISTED)
+        .map(|path| display_path_for_ui(path))
+        .collect::<Vec<_>>();
+
+    if listed.is_empty() {
+        return "Cannot commit: unresolved merge conflicts detected. Resolve conflicts and stage files, then retry.".to_string();
+    }
+
+    let suffix = if total > MAX_LISTED {
+        format!(" and {} more", total - MAX_LISTED)
+    } else {
+        String::new()
+    };
+
+    format!(
+        "Cannot commit: unresolved merge conflicts in {} file(s): {}{}. Resolve conflicts and stage files, then retry.",
+        total,
+        listed.join(", "),
+        suffix
+    )
 }
 
 fn format_pr_status_summary(summary: &GitPullRequestStatusSummary) -> String {

@@ -74,7 +74,10 @@ pub fn initialize_logging(options: &RuntimeOptions) -> Result<Option<PathBuf>> {
         fs::create_dir_all(parent)?;
     }
 
-    let file = OpenOptions::new().create(true).append(true).open(&log_path)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
     let mut config_builder = ConfigBuilder::new();
     let _ = config_builder.set_time_offset_to_local();
     let config = config_builder.build();

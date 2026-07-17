@@ -119,10 +119,18 @@ pub fn merge_pull_request(
 }
 
 pub fn create_pull_request(repo_root: &Path, title: &str, body: &str) -> Result<()> {
-    run_command("gh", ["pr", "create", "--title", title, "--body", body], repo_root).map(|_| ())
+    run_command(
+        "gh",
+        ["pr", "create", "--title", title, "--body", body],
+        repo_root,
+    )
+    .map(|_| ())
 }
 
-pub fn pull_request_status_summary(repo_root: &Path, pr_number: u64) -> Result<PullRequestStatusSummary> {
+pub fn pull_request_status_summary(
+    repo_root: &Path,
+    pr_number: u64,
+) -> Result<PullRequestStatusSummary> {
     let raw = run_command(
         "gh",
         [
@@ -138,7 +146,8 @@ pub fn pull_request_status_summary(repo_root: &Path, pr_number: u64) -> Result<P
 }
 
 fn parse_pull_request_status_summary(raw: &str) -> Result<PullRequestStatusSummary> {
-    let value = serde_json::from_str::<Value>(raw).context("Failed to parse `gh pr view` output")?;
+    let value =
+        serde_json::from_str::<Value>(raw).context("Failed to parse `gh pr view` output")?;
 
     let merge_state_status = value
         .get("mergeStateStatus")
@@ -168,9 +177,21 @@ fn parse_pull_request_status_summary(raw: &str) -> Result<PullRequestStatusSumma
             }
 
             checks_total += 1;
-            if matches!(raw_state.as_str(), "SUCCESS" | "EXPECTED" | "NEUTRAL" | "SKIPPED") {
+            if matches!(
+                raw_state.as_str(),
+                "SUCCESS" | "EXPECTED" | "NEUTRAL" | "SKIPPED"
+            ) {
                 checks_passing += 1;
-            } else if matches!(raw_state.as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED" | "STALE" | "STARTUP_FAILURE") {
+            } else if matches!(
+                raw_state.as_str(),
+                "FAILURE"
+                    | "ERROR"
+                    | "CANCELLED"
+                    | "TIMED_OUT"
+                    | "ACTION_REQUIRED"
+                    | "STALE"
+                    | "STARTUP_FAILURE"
+            ) {
                 checks_failing += 1;
             } else {
                 checks_pending += 1;

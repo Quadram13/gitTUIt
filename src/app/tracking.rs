@@ -5,7 +5,8 @@ use super::{App, Screen};
 impl App {
     pub fn enter_tracking_status_view(&mut self) -> Result<()> {
         if !self.has_open_repo() {
-            self.status_message = "Open a repository before comparing incoming/outgoing commits".to_string();
+            self.status_message =
+                "Open a repository before comparing incoming/outgoing commits".to_string();
             return Ok(());
         }
         self.screen = Screen::TrackingStatusView;

@@ -156,7 +156,10 @@ fn build_rows(files: &[FileLeaf], expanded_dirs: &HashSet<String>) -> Vec<TreeRo
     let mut dir_children: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for dir in all_dirs {
         let parent = dir.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
-        dir_children.entry(parent.to_string()).or_default().push(dir);
+        dir_children
+            .entry(parent.to_string())
+            .or_default()
+            .push(dir);
     }
     for children in dir_children.values_mut() {
         children.sort();
@@ -168,7 +171,10 @@ fn build_rows(files: &[FileLeaf], expanded_dirs: &HashSet<String>) -> Vec<TreeRo
             .rsplit_once('/')
             .map(|(parent, _)| parent.to_string())
             .unwrap_or_default();
-        files_by_parent.entry(parent).or_default().push((path, status));
+        files_by_parent
+            .entry(parent)
+            .or_default()
+            .push((path, status));
     }
     for children in files_by_parent.values_mut() {
         children.sort_by(|(left, _), (right, _)| left.cmp(right));

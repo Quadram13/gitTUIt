@@ -46,7 +46,9 @@ impl App {
             self.status_message = "No commit selected".to_string();
             return Ok(());
         };
-        if self.history_details_for.as_deref() == Some(entry.hash.as_str()) && self.history_details.is_some() {
+        if self.history_details_for.as_deref() == Some(entry.hash.as_str())
+            && self.history_details.is_some()
+        {
             self.status_message = format!("Commit details already loaded ({})", entry.short_hash);
             return Ok(());
         }
@@ -59,16 +61,18 @@ impl App {
         self.history_details_inflight = Some(request_id);
         self.set_async_running_status(&format!("Loading commit details {}", short_hash));
         let tx = self.async_tx.clone();
-        if let Err(err) = self.queue_cancellable_async_task(JOB_HISTORY_DETAILS, request_id, move || {
-            let details =
-                git::commit_details_structured(&root, &commit_hash).map_err(|err| err.to_string());
-            let _ = tx.send(AppAsyncEvent::HistoryDetailsReady {
-                request_id,
-                commit_hash,
-                short_hash,
-                details,
-            });
-        }) {
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_HISTORY_DETAILS, request_id, move || {
+                let details = git::commit_details_structured(&root, &commit_hash)
+                    .map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::HistoryDetailsReady {
+                    request_id,
+                    commit_hash,
+                    short_hash,
+                    details,
+                });
+            })
+        {
             self.history_details_inflight = None;
             return Err(err);
         }
@@ -130,7 +134,8 @@ impl App {
 
         let commit_hash = entry.hash.clone();
         let root = self.current_repo_root()?.to_path_buf();
-        self.history_file_history_request_seq = self.history_file_history_request_seq.saturating_add(1);
+        self.history_file_history_request_seq =
+            self.history_file_history_request_seq.saturating_add(1);
         let request_id = self.history_file_history_request_seq;
         self.history_file_history_inflight = Some(request_id);
         self.history_file_history_for_path = Some(path.clone());
@@ -240,13 +245,15 @@ impl App {
         let request_id = self.history_entries_request_seq;
         self.history_entries_inflight = Some(request_id);
         let tx = self.async_tx.clone();
-        if let Err(err) = self.queue_cancellable_async_task(JOB_HISTORY_ENTRIES, request_id, move || {
-            let entries = git::commit_history(&root, 50).map_err(|err| err.to_string());
-            let _ = tx.send(AppAsyncEvent::HistoryEntriesReady {
-                request_id,
-                entries,
-            });
-        }) {
+        if let Err(err) =
+            self.queue_cancellable_async_task(JOB_HISTORY_ENTRIES, request_id, move || {
+                let entries = git::commit_history(&root, 50).map_err(|err| err.to_string());
+                let _ = tx.send(AppAsyncEvent::HistoryEntriesReady {
+                    request_id,
+                    entries,
+                });
+            })
+        {
             self.history_entries_inflight = None;
             return Err(err);
         }
@@ -284,7 +291,11 @@ impl App {
                     .enumerate()
                     .take(18)
                     .map(|(idx, file_commit)| {
-                        let marker = if idx == self.history_file_history_selected { ">" } else { " " };
+                        let marker = if idx == self.history_file_history_selected {
+                            ">"
+                        } else {
+                            " "
+                        };
                         format!(
                             "{marker} {} {} ({})",
                             file_commit.short_hash, file_commit.summary, file_commit.relative_time
@@ -302,7 +313,11 @@ impl App {
                 .enumerate()
                 .take(24)
                 .map(|(idx, file)| {
-                    let marker = if idx == self.history_file_tree_selected { ">" } else { " " };
+                    let marker = if idx == self.history_file_tree_selected {
+                        ">"
+                    } else {
+                        " "
+                    };
                     format!("{marker} [{}] {}", file.status, file.path)
                 })
                 .collect::<Vec<_>>()
@@ -342,7 +357,8 @@ impl App {
     }
 
     pub(crate) fn selected_history_file_path(&self) -> Option<String> {
-        self.history_tree.selected_file_path(self.history_file_tree_selected)
+        self.history_tree
+            .selected_file_path(self.history_file_tree_selected)
     }
 
     pub fn history_details_visible(&self) -> bool {
@@ -395,7 +411,12 @@ impl App {
             return self
                 .history_file_history_entries
                 .iter()
-                .map(|entry| format!("{} {} ({})", entry.short_hash, entry.summary, entry.relative_time))
+                .map(|entry| {
+                    format!(
+                        "{} {} ({})",
+                        entry.short_hash, entry.summary, entry.relative_time
+                    )
+                })
                 .collect();
         }
 
@@ -456,8 +477,9 @@ impl App {
         if self.history_tree.len() == 0 {
             self.history_file_tree_selected = 0;
         } else {
-            self.history_file_tree_selected =
-                self.history_file_tree_selected.min(self.history_tree.len().saturating_sub(1));
+            self.history_file_tree_selected = self
+                .history_file_tree_selected
+                .min(self.history_tree.len().saturating_sub(1));
         }
     }
 
@@ -489,4 +511,3 @@ impl App {
         collapsed
     }
 }
-

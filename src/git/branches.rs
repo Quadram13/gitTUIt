@@ -35,7 +35,9 @@ pub fn list_remote_branches(repo_root: &Path) -> Result<Vec<RemoteBranchEntry>> 
     let mut entries = sync::get_branches_info(&repo_path, false)?
         .into_iter()
         .filter_map(|branch| {
-            if branch.name.is_empty() || branch.name.ends_with("/HEAD") || branch.name.contains("->")
+            if branch.name.is_empty()
+                || branch.name.ends_with("/HEAD")
+                || branch.name.contains("->")
             {
                 return None;
             }

@@ -59,7 +59,10 @@ pub fn commit_history(repo_root: &Path, max_count: usize) -> Result<Vec<CommitEn
     Ok(parse_commit_history(&raw))
 }
 
-pub fn tracking_commit_summary(repo_root: &Path, max_count: usize) -> Result<TrackingCommitSummary> {
+pub fn tracking_commit_summary(
+    repo_root: &Path,
+    max_count: usize,
+) -> Result<TrackingCommitSummary> {
     let upstream = run_command(
         "git",
         ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],

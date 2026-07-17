@@ -34,7 +34,14 @@ pub fn stash_drop(repo_root: &Path, reference: &str) -> Result<()> {
 pub fn stash_show(repo_root: &Path, reference: &str) -> Result<String> {
     run_command(
         "git",
-        ["stash", "show", "--patch", "--stat", "--color=never", reference],
+        [
+            "stash",
+            "show",
+            "--patch",
+            "--stat",
+            "--color=never",
+            reference,
+        ],
         repo_root,
     )
 }

@@ -1,5 +1,4 @@
 use std::{
-    env,
     fs,
     path::{Path, PathBuf},
 };
@@ -7,10 +6,9 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-const APP_DIR_NAME: &str = "gitTUIt";
-const APP_DIR_NAME_DEV: &str = "gitTUIt-dev";
 const REPOS_FILE_NAME: &str = "repos.json";
-const CONFIG_DIR_ENV_VAR: &str = "GITTUIT_CONFIG_DIR";
+
+use crate::runtime_paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepoRegistry {
@@ -110,29 +108,8 @@ pub fn normalize_repo_path_input(input: &str) -> String {
 }
 
 fn registry_file_path() -> Result<PathBuf> {
-    let base_dir = resolve_config_base_dir()?;
+    let base_dir = runtime_paths::config_dir()?;
     Ok(base_dir.join(REPOS_FILE_NAME))
-}
-
-fn resolve_config_base_dir() -> Result<PathBuf> {
-    if let Ok(override_dir) = env::var(CONFIG_DIR_ENV_VAR) {
-        let trimmed = override_dir.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!(
-                "{} is set but empty. Provide a valid directory path.",
-                CONFIG_DIR_ENV_VAR
-            ));
-        }
-        return Ok(PathBuf::from(trimmed));
-    }
-
-    let config_dir = dirs::config_dir().ok_or_else(|| anyhow!("Could not determine config directory"))?;
-    let app_dir = if cfg!(debug_assertions) {
-        APP_DIR_NAME_DEV
-    } else {
-        APP_DIR_NAME
-    };
-    Ok(config_dir.join(app_dir))
 }
 
 fn strip_matching_wrapping_quotes(input: &str) -> &str {

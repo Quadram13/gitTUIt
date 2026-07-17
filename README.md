@@ -34,17 +34,18 @@ Currently, this TUI can replace(at least for me) the functionality of Github Des
 
 A concrete list of upcoming changes(in order):
 
-* changelog/packaging/release setup(in progress)
-    - basic workflow structure is in place
-    - remaining work:
-        * binary builds triggered by release tags
-        * installer packaging/publishing workflow
-        * post-release verification
-
-* plugin implementation
+* refactor TUI for Lua plugins/customization
     - potential plugins for my current use include commit message building with conventional commits and merging release followup PRs from github actions
 
-    - other ideas for plugins will be added here as they come up
+    - themes/colors/keybinds/others may be a mix of config files and plugins
+
+    - other ideas for plugins/customization will be added here as they come up
+
+* changelog/packaging/release setup(in progress)
+    - basic github actions workflow structure is in place
+    - remaining work:
+        * implement local build tasks
+        * enable/test actions after completing plugin refactor and local build
 
 * async architecture(remaining):
     - current async implementation uses github as the source for the asyncgit crate, because using the crate from crates.io leads to a git2 version mismatch
@@ -54,17 +55,12 @@ A concrete list of upcoming changes(in order):
     - add broader tests for async race handling/cancellation semantics under rapid selection/view changes
     - evolve lifecycle model from queued/running/idle to include explicit success/error/cancelled states in one unified job registry
 
-* customization(themes, colors, syntax highlighting, keybinds)
-    - might be better to handle these through plugins as well
-
 These are changes/things I note that may not slot cleanly into the list:
 
 - not sure if this app/repo contains/interacts with any sensitive info
     * should probably do a check for any security concerns
 
 - repo setup for contribution
-    * proper license(probably MIT?)
-
     * proper dependency tracking
 
 - integration of other version control/developer platforms (e.g. GitLab)?
@@ -96,13 +92,16 @@ You can run from anywhere; repositories are explicitly added in-app.
 
 ## Release Workflow
 
-This repo currently uses Release Please on `main` for the release flow:
+This repo currently uses a split CI/CD + Release Please workflow:
 
+- `.github/workflows/ci.yml`
+- `.github/workflows/cd.yml`
 - `.github/workflows/release-please.yml`
-- `.github/workflows/release-pr-lock-sync.yml`
 - `release-please-config.json`
 - `.release-please-manifest.json`
 - `CHANGELOG.md`
+
+> Workflow status: automated GitHub triggers are temporarily disabled while install/plugin refactor work is prioritized. Workflows can still be run manually via `workflow_dispatch`.
 
 Current release component naming:
 
@@ -154,9 +153,19 @@ Notes:
 
 ### Security Audit
 
-- CI runs `cargo audit` via `.github/workflows/security-audit.yml`.
+- CI runs `cargo audit` via `.github/workflows/ci.yml` using pinned `cargo-audit` with cache-backed install.
 - `.cargo/audit.toml` currently ignores `RUSTSEC-2023-0071` (transitive via `asyncgit -> ssh-key -> rsa`) because no fixed upstream upgrade is available yet.
 - This ignore should be removed once an upstream dependency fix is available.
+
+### Branch Ruleset Checks (When CI Is Re-enabled)
+
+When re-enabling required status checks on `main`, use the CI jobs below:
+
+- `verify-lockfile` (required)
+- `cargo-audit` (required)
+- `buildability` matrix checks (recommended required for all configured OS targets)
+
+`sync-lockfile` is release-automation support and is left non-required.
 
 ## Repository Tracking
 
@@ -164,11 +173,15 @@ Notes:
 - Added path must be a git root (must contain `.git` directly at that folder root).
 - Tracked repositories are stored in a per-user JSON file in the OS config directory.
 
-Config directory resolution:
+Runtime directory contract:
 
-- If `GITTUIT_CONFIG_DIR` is set, that directory is used for `repos.json`.
-- Otherwise, debug builds (for example `cargo run`) use `gitTUIt-dev` under the OS config directory.
-- Release builds use `gitTUIt` under the OS config directory.
+- **Config**: if `GITTUIT_CONFIG_DIR` is set, that directory is used. Otherwise:
+  - debug builds (for example `cargo run`) use `gitTUIt-dev` under OS config dir
+  - release builds use `gitTUIt` under OS config dir
+- **Data**: OS data dir + app folder (`gitTUIt` / `gitTUIt-dev`)
+- **Cache**: OS cache dir + app folder (`gitTUIt` / `gitTUIt-dev`)
+- **Logs**: `<config-dir>/logs/gitTUIt.log` by default
+- Plugin-specific directory conventions are deferred to the plugin phase.
 
 ## License
 

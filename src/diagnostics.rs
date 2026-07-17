@@ -1,20 +1,17 @@
 use std::{
-    env,
     fs::{self, OpenOptions},
-    process::Command,
     path::PathBuf,
+    process::Command,
 };
 
 use anyhow::{Result, anyhow};
 use log::LevelFilter;
 use simplelog::{ConfigBuilder, WriteLogger};
 
-const APP_DIR_NAME: &str = "gitTUIt";
-const APP_DIR_NAME_DEV: &str = "gitTUIt-dev";
-const LOG_DIR_NAME: &str = "logs";
 const DEFAULT_LOG_FILE_NAME: &str = "gitTUIt.log";
 const REPOS_FILE_NAME: &str = "repos.json";
-const CONFIG_DIR_ENV_VAR: &str = "GITTUIT_CONFIG_DIR";
+
+use crate::runtime_paths;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeOptions {
@@ -97,7 +94,10 @@ pub fn resolve_log_file_path(options: &RuntimeOptions) -> Result<PathBuf> {
 }
 
 pub fn doctor_report(options: &RuntimeOptions) -> Result<String> {
-    let config_dir = resolve_config_base_dir()?;
+    let config_dir = runtime_paths::config_dir()?;
+    let data_dir = runtime_paths::data_dir()?;
+    let cache_dir = runtime_paths::cache_dir()?;
+    let logs_dir = runtime_paths::logs_dir()?;
     let repos_file = config_dir.join(REPOS_FILE_NAME);
     let log_file = resolve_log_file_path(options)?;
 
@@ -110,14 +110,20 @@ pub fn doctor_report(options: &RuntimeOptions) -> Result<String> {
          Logging enabled: {}\n\
          Log level: {}\n\
          Log file path: {}\n\
+         Logs dir: {}\n\
          Config dir: {}\n\
+         Data dir: {}\n\
+         Cache dir: {}\n\
          Repo registry path: {}\n\
          git version: {}\n\
          gh version: {}\n",
         options.logging_enabled,
         options.log_level,
         log_file.display(),
+        logs_dir.display(),
         config_dir.display(),
+        data_dir.display(),
+        cache_dir.display(),
         repos_file.display(),
         git_version,
         gh_version
@@ -139,31 +145,7 @@ fn parse_level_filter(raw: &str) -> Result<LevelFilter> {
 }
 
 pub fn default_log_file_path() -> Result<PathBuf> {
-    Ok(resolve_config_base_dir()?
-        .join(LOG_DIR_NAME)
-        .join(DEFAULT_LOG_FILE_NAME))
-}
-
-fn resolve_config_base_dir() -> Result<PathBuf> {
-    if let Ok(override_dir) = env::var(CONFIG_DIR_ENV_VAR) {
-        let trimmed = override_dir.trim();
-        if trimmed.is_empty() {
-            return Err(anyhow!(
-                "{} is set but empty. Provide a valid directory path.",
-                CONFIG_DIR_ENV_VAR
-            ));
-        }
-        return Ok(PathBuf::from(trimmed));
-    }
-
-    let config_dir =
-        dirs::config_dir().ok_or_else(|| anyhow!("Could not determine config directory"))?;
-    let app_dir = if cfg!(debug_assertions) {
-        APP_DIR_NAME_DEV
-    } else {
-        APP_DIR_NAME
-    };
-    Ok(config_dir.join(app_dir))
+    Ok(runtime_paths::logs_dir()?.join(DEFAULT_LOG_FILE_NAME))
 }
 
 fn command_version(program: &str) -> String {

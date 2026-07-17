@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  # Temporarily disabled while release/install strategy is refocused.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-lockfile:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-lockfile-verify
+
+      - name: Regenerate lockfile metadata
+        run: cargo metadata --format-version=1 > /dev/null
+
+      - name: Ensure Cargo.lock is up to date
+        shell: bash
+        run: |
+          if ! git diff --quiet -- Cargo.lock; then
+            echo "::error::Cargo.lock is out of date. Regenerate it and commit the result."
+            git --no-pager diff -- Cargo.lock
+            exit 1
+          fi
+          echo "Cargo.lock is in sync."
+
+  cargo-audit:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_AUDIT_VERSION: "0.21.2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo-audit caches
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-audit-${{ env.CARGO_AUDIT_VERSION }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-audit if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${CARGO_AUDIT_VERSION}"
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked --version "${expected}"
+            exit 0
+          fi
+
+          current="$(cargo-audit --version | awk '{print $2}')"
+          if [[ "${current}" != "${expected}" ]]; then
+            cargo install cargo-audit --locked --version "${expected}" --force
+          fi
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  buildability:
+    if: github.event_name != 'pull_request_target'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-buildability-${{ matrix.os }}
+
+      - name: Build
+        run: cargo build --locked --release
+
+      - name: Test (ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test --locked
+
+  sync-lockfile:
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Check whether PR is a release PR
+        id: guard
+        shell: bash
+        run: |
+          if [[ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]]; then
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping: PR head is from a different repository."
+            exit 0
+          fi
+          if [[ "${{ github.event.pull_request.title }}" =~ ^chore:\ release ]]; then
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout release PR branch
+        if: steps.guard.outputs.is_release == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.repository }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Rust toolchain
+        if: steps.guard.outputs.is_release == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore cargo cache
+        if: steps.guard.outputs.is_release == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-release-pr-lock-sync
+
+      - name: Refresh lockfile
+        if: steps.guard.outputs.is_release == 'true'
+        run: cargo metadata --format-version=1 > /dev/null
+
+      - name: Commit and push lockfile updates
+        if: steps.guard.outputs.is_release == 'true'
+        shell: bash
+        run: |
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git commit -m "chore(repo): sync Cargo.lock for release PR"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+
+      - name: No-op for non-release PRs
+        if: steps.guard.outputs.is_release != 'true'
+        run: echo "Non-release PR detected; lock sync check passes with no-op."

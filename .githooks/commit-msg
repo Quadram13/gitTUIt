@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-if [[ $# -ne 1 ]]; then
+if [ "$#" -ne 1 ]; then
   echo "Usage: commit-msg <path-to-commit-message>" >&2
   exit 1
 fi
@@ -10,12 +10,12 @@ repo_root="$(git rev-parse --show-toplevel)"
 validator="${repo_root}/scripts/validate_commit_msg.ps1"
 bash_validator="${repo_root}/scripts/validate_commit_msg.sh"
 
-if command -v pwsh >/dev/null 2>&1 && [[ -f "${validator}" ]]; then
+if command -v pwsh >/dev/null 2>&1 && [ -f "${validator}" ]; then
   pwsh -NoProfile -File "${validator}" "$1"
   exit $?
 fi
 
-if command -v bash >/dev/null 2>&1 && [[ -f "${bash_validator}" ]]; then
+if command -v bash >/dev/null 2>&1 && [ -f "${bash_validator}" ]; then
   bash "${bash_validator}" "$1"
   exit $?
 fi

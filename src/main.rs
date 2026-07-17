@@ -3,6 +3,7 @@ mod app;
 mod diagnostics;
 mod git;
 mod repo_registry;
+mod runtime_paths;
 mod tree;
 mod ui;
 

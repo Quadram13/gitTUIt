@@ -1,11 +1,7 @@
 name: Release Please
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - Cargo.lock
+  # Temporarily disabled while release/install strategy is refocused.
   workflow_dispatch:
 
 permissions:

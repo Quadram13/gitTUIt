@@ -2,6 +2,14 @@
 name = "gitTUIt"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal UI for Git/GitHub workflows with release automation tooling"
+authors = ["Quadram13"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Quadram13/gitTUIt"
+homepage = "https://github.com/Quadram13/gitTUIt"
+keywords = ["git", "github", "tui", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 anyhow = "1.0.103"

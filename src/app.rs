@@ -14,6 +14,7 @@ use std::{
 use anyhow::{Result, anyhow};
 
 use crate::{
+    commit_config::{self, CommitPolicy},
     diagnostics,
     git::{
         self, BranchEntry as GitBranchEntry, CommitDetails as GitCommitDetails,
@@ -179,8 +180,7 @@ pub enum Screen {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputMode {
     None,
-    CommitSubject,
-    CommitBody,
+    CommitComposer,
     AddRepoPath,
     NewBranchName,
     CreatePullRequestTitle,
@@ -358,7 +358,7 @@ pub struct App {
     pending_pr_merge: Option<PendingPullRequestMerge>,
     pending_stash_drop: Option<String>,
     pending_pr_title: Option<String>,
-    pending_commit_subject: Option<String>,
+    pending_commit_builder: Option<PendingCommitBuilder>,
     runtime_log_path: Option<PathBuf>,
     repo_preview_key: Option<String>,
     repo_preview_text: String,
@@ -412,6 +412,24 @@ pub struct BrowserEntry {
 }
 
 #[derive(Debug, Clone)]
+pub struct CommitComposerViewState {
+    pub focus: CommitComposerPane,
+    pub subject: String,
+    pub body: String,
+    pub additional_entries: Vec<String>,
+    pub selected_additional: usize,
+    pub has_additional_entries: bool,
+    pub subject_field: CommitEntryField,
+    pub additional_field: CommitEntryField,
+    pub subject_type_filter: String,
+    pub subject_type_options: Vec<String>,
+    pub additional_type_filter: String,
+    pub additional_type_options: Vec<String>,
+    pub subject_selected_type: String,
+    pub additional_selected_type: String,
+}
+
+#[derive(Debug, Clone)]
 struct PendingDiscard {
     path: String,
     is_untracked: bool,
@@ -422,6 +440,41 @@ struct PendingPullRequestMerge {
     number: u64,
     title: String,
     method: GitPullRequestMergeMethod,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCommitBuilder {
+    policy: CommitPolicy,
+    has_guarded_changes: bool,
+    allowed_types: Vec<String>,
+    subject: ChangeEntryDraft,
+    body: String,
+    additional_entries: Vec<ChangeEntryDraft>,
+    selected_additional: usize,
+    focus: CommitComposerPane,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitComposerPane {
+    Subject,
+    Body,
+    AdditionalEntries,
+}
+
+#[derive(Debug, Clone)]
+struct ChangeEntryDraft {
+    type_idx: usize,
+    breaking: bool,
+    description: String,
+    cursor: usize,
+    field: CommitEntryField,
+    type_filter: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitEntryField {
+    Type,
+    Description,
 }
 
 impl App {
@@ -483,7 +536,7 @@ impl App {
             pending_pr_merge: None,
             pending_stash_drop: None,
             pending_pr_title: None,
-            pending_commit_subject: None,
+            pending_commit_builder: None,
             runtime_log_path: None,
             repo_preview_key: None,
             repo_preview_text: "No unstaged diff output for selected file.".to_string(),
@@ -858,6 +911,22 @@ impl App {
                     ],
                 );
                 section("Workspace", &workspace_tabs);
+                if self.input_mode == InputMode::CommitComposer {
+                    section(
+                        "Commit Composer",
+                        &[
+                            "[Tab]/[Shift+Tab] switch pane focus".to_string(),
+                            "[Ctrl+Left]/[Ctrl+Right] switch type/description".to_string(),
+                            "[Type mode] type to filter + [Up]/[Down] choose".to_string(),
+                            "[Left]/[Right] move text cursor".to_string(),
+                            "[Ctrl+B] toggle breaking marker".to_string(),
+                            "[Ctrl+N]/[Ctrl+D] add/remove additional entry".to_string(),
+                            "[Up]/[Down] select additional entry".to_string(),
+                            "[Ctrl+S]/[F2] submit commit".to_string(),
+                            "[Esc] cancel composer".to_string(),
+                        ],
+                    );
+                }
             }
         }
 
@@ -1198,11 +1267,424 @@ impl App {
                 return;
             }
         }
-        self.pending_commit_subject = None;
-        self.input_mode = InputMode::CommitSubject;
+        let load_result = commit_config::load_effective_commit_policy(Some(&root));
+        let has_guarded_changes =
+            staged_paths_match_guarded_prefixes(&self.snapshot.staged, &load_result.policy);
+        let allowed_types = commit_allowed_types(&load_result.policy, has_guarded_changes);
+        if allowed_types.is_empty() {
+            self.status_message =
+                "No commit types are allowed for current staged changes under active policy"
+                    .to_string();
+            return;
+        }
+
+        self.pending_commit_builder = Some(PendingCommitBuilder {
+            policy: load_result.policy,
+            has_guarded_changes,
+            allowed_types,
+            subject: ChangeEntryDraft {
+                type_idx: 0,
+                breaking: false,
+                description: String::new(),
+                cursor: 0,
+                field: CommitEntryField::Description,
+                type_filter: String::new(),
+            },
+            body: String::new(),
+            additional_entries: Vec::new(),
+            selected_additional: 0,
+            focus: CommitComposerPane::Subject,
+        });
+        self.input_mode = InputMode::CommitComposer;
         self.input_buffer.clear();
         self.input_cursor = 0;
-        self.status_message = "Enter commit subject and press [Enter]".to_string();
+        self.status_message = if load_result.warnings.is_empty() {
+            "Commit composer opened".to_string()
+        } else {
+            format!(
+                "Commit config warning: {}",
+                load_result.warnings.join(" | ")
+            )
+        };
+    }
+
+    pub fn commit_composer_focus_next(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        builder.focus = match builder.focus {
+            CommitComposerPane::Subject => CommitComposerPane::Body,
+            CommitComposerPane::Body => CommitComposerPane::AdditionalEntries,
+            CommitComposerPane::AdditionalEntries => CommitComposerPane::Subject,
+        };
+    }
+
+    pub fn commit_composer_focus_prev(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        builder.focus = match builder.focus {
+            CommitComposerPane::Subject => CommitComposerPane::AdditionalEntries,
+            CommitComposerPane::Body => CommitComposerPane::Subject,
+            CommitComposerPane::AdditionalEntries => CommitComposerPane::Body,
+        };
+    }
+
+    pub fn commit_composer_toggle_breaking(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        let (is_body_focus, type_idx, current_breaking) = match builder.focus {
+            CommitComposerPane::Subject => (
+                false,
+                builder.subject.type_idx,
+                builder.subject.breaking,
+            ),
+            CommitComposerPane::Body => (true, 0, false),
+            CommitComposerPane::AdditionalEntries => {
+                if builder.additional_entries.is_empty() {
+                    return;
+                }
+                let idx = builder
+                    .selected_additional
+                    .min(builder.additional_entries.len().saturating_sub(1));
+                (
+                    false,
+                    builder.additional_entries[idx].type_idx,
+                    builder.additional_entries[idx].breaking,
+                )
+            }
+        };
+        if is_body_focus {
+            return;
+        }
+
+        let Some(selected_type) = builder.allowed_types.get(type_idx) else {
+            return;
+        };
+        if !builder
+            .policy
+            .releasable_types
+            .iter()
+            .any(|value| value == selected_type)
+        {
+            self.status_message = format!("Type '{}' cannot be marked breaking", selected_type);
+            return;
+        }
+        let next_breaking = !current_breaking;
+        match builder.focus {
+            CommitComposerPane::Subject => builder.subject.breaking = next_breaking,
+            CommitComposerPane::Body => {}
+            CommitComposerPane::AdditionalEntries => {
+                if builder.additional_entries.is_empty() {
+                    return;
+                }
+                let idx = builder
+                    .selected_additional
+                    .min(builder.additional_entries.len().saturating_sub(1));
+                builder.additional_entries[idx].breaking = next_breaking;
+            }
+        }
+    }
+
+    pub fn commit_composer_switch_entry_field_prev(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        let Some(entry) = commit_composer_active_entry_mut(builder) else {
+            return;
+        };
+        entry.field = match entry.field {
+            CommitEntryField::Type => CommitEntryField::Description,
+            CommitEntryField::Description => CommitEntryField::Type,
+        };
+    }
+
+    pub fn commit_composer_switch_entry_field_next(&mut self) {
+        self.commit_composer_switch_entry_field_prev();
+    }
+
+    pub fn commit_composer_add_entry(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        builder.additional_entries.push(ChangeEntryDraft {
+            type_idx: 0,
+            breaking: false,
+            description: String::new(),
+            cursor: 0,
+            field: CommitEntryField::Description,
+            type_filter: String::new(),
+        });
+        builder.selected_additional = builder.additional_entries.len().saturating_sub(1);
+        builder.focus = CommitComposerPane::AdditionalEntries;
+    }
+
+    pub fn commit_composer_remove_selected_entry(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        if builder.additional_entries.is_empty() {
+            return;
+        }
+        let idx = builder
+            .selected_additional
+            .min(builder.additional_entries.len().saturating_sub(1));
+        builder.additional_entries.remove(idx);
+        builder.selected_additional = builder
+            .selected_additional
+            .min(builder.additional_entries.len().saturating_sub(1));
+    }
+
+    pub fn commit_composer_select_next_entry(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        if commit_composer_active_entry_is_type(builder) {
+            let allowed_types = builder.allowed_types.clone();
+            let filtered = {
+                let Some(entry) = commit_composer_active_entry_mut(builder) else {
+                    return;
+                };
+                filtered_type_indices(&allowed_types, &entry.type_filter)
+            };
+            if filtered.is_empty() {
+                return;
+            }
+            let Some(entry) = commit_composer_active_entry_mut(builder) else {
+                return;
+            };
+            let current_pos = filtered
+                .iter()
+                .position(|idx| *idx == entry.type_idx)
+                .unwrap_or(0);
+            let next_pos = (current_pos + 1) % filtered.len();
+            entry.type_idx = filtered[next_pos];
+            ensure_breaking_valid(builder);
+            return;
+        }
+        if builder.focus != CommitComposerPane::AdditionalEntries || builder.additional_entries.is_empty() {
+            return;
+        }
+        builder.selected_additional = (builder.selected_additional + 1)
+            .min(builder.additional_entries.len().saturating_sub(1));
+    }
+
+    pub fn commit_composer_select_prev_entry(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        if commit_composer_active_entry_is_type(builder) {
+            let allowed_types = builder.allowed_types.clone();
+            let filtered = {
+                let Some(entry) = commit_composer_active_entry_mut(builder) else {
+                    return;
+                };
+                filtered_type_indices(&allowed_types, &entry.type_filter)
+            };
+            if filtered.is_empty() {
+                return;
+            }
+            let Some(entry) = commit_composer_active_entry_mut(builder) else {
+                return;
+            };
+            let current_pos = filtered
+                .iter()
+                .position(|idx| *idx == entry.type_idx)
+                .unwrap_or(0);
+            let prev_pos = (current_pos + filtered.len() - 1) % filtered.len();
+            entry.type_idx = filtered[prev_pos];
+            ensure_breaking_valid(builder);
+            return;
+        }
+        if builder.focus != CommitComposerPane::AdditionalEntries {
+            return;
+        }
+        builder.selected_additional = builder.selected_additional.saturating_sub(1);
+    }
+
+    pub fn commit_composer_push_char(&mut self, ch: char) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        match builder.focus {
+            CommitComposerPane::Subject => {
+                if builder.subject.field == CommitEntryField::Type {
+                    builder.subject.type_filter.push(ch);
+                    apply_filter_to_entry(&builder.allowed_types, &mut builder.subject);
+                    ensure_breaking_valid(builder);
+                } else {
+                    insert_char_at_cursor(
+                        &mut builder.subject.description,
+                        &mut builder.subject.cursor,
+                        ch,
+                    );
+                }
+            }
+            CommitComposerPane::Body => insert_char_at_cursor(&mut builder.body, &mut self.input_cursor, ch),
+            CommitComposerPane::AdditionalEntries => {
+                if builder.additional_entries.is_empty() {
+                    return;
+                }
+                let idx = builder
+                    .selected_additional
+                    .min(builder.additional_entries.len().saturating_sub(1));
+                let entry = &mut builder.additional_entries[idx];
+                if entry.field == CommitEntryField::Type {
+                    entry.type_filter.push(ch);
+                    apply_filter_to_entry(&builder.allowed_types, entry);
+                    ensure_breaking_valid(builder);
+                } else {
+                    insert_char_at_cursor(&mut entry.description, &mut entry.cursor, ch);
+                }
+            }
+        }
+    }
+
+    pub fn commit_composer_backspace(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        match builder.focus {
+            CommitComposerPane::Subject => {
+                if builder.subject.field == CommitEntryField::Type {
+                    builder.subject.type_filter.pop();
+                    apply_filter_to_entry(&builder.allowed_types, &mut builder.subject);
+                    ensure_breaking_valid(builder);
+                } else {
+                    backspace_char_at_cursor(
+                        &mut builder.subject.description,
+                        &mut builder.subject.cursor,
+                    );
+                }
+            }
+            CommitComposerPane::Body => {
+                backspace_char_at_cursor(&mut builder.body, &mut self.input_cursor);
+            }
+            CommitComposerPane::AdditionalEntries => {
+                if builder.additional_entries.is_empty() {
+                    return;
+                }
+                let idx = builder
+                    .selected_additional
+                    .min(builder.additional_entries.len().saturating_sub(1));
+                let entry = &mut builder.additional_entries[idx];
+                if entry.field == CommitEntryField::Type {
+                    entry.type_filter.pop();
+                    apply_filter_to_entry(&builder.allowed_types, entry);
+                    ensure_breaking_valid(builder);
+                } else {
+                    backspace_char_at_cursor(&mut entry.description, &mut entry.cursor);
+                }
+            }
+        }
+    }
+
+    pub fn commit_composer_insert_newline(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        if builder.focus == CommitComposerPane::Body {
+            insert_char_at_cursor(&mut builder.body, &mut self.input_cursor, '\n');
+        }
+    }
+
+    pub fn commit_composer_cursor_left(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        match builder.focus {
+            CommitComposerPane::Subject => {
+                if builder.subject.field == CommitEntryField::Description {
+                    builder.subject.cursor = builder.subject.cursor.saturating_sub(1)
+                }
+            }
+            CommitComposerPane::Body => {
+                self.input_cursor = self.input_cursor.saturating_sub(1);
+            }
+            CommitComposerPane::AdditionalEntries => {
+                if builder.additional_entries.is_empty() {
+                    return;
+                }
+                let idx = builder
+                    .selected_additional
+                    .min(builder.additional_entries.len().saturating_sub(1));
+                if builder.additional_entries[idx].field == CommitEntryField::Description {
+                    builder.additional_entries[idx].cursor =
+                        builder.additional_entries[idx].cursor.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    pub fn commit_composer_cursor_right(&mut self) {
+        if self.input_mode != InputMode::CommitComposer {
+            return;
+        }
+        let Some(builder) = self.pending_commit_builder.as_mut() else {
+            return;
+        };
+        match builder.focus {
+            CommitComposerPane::Subject => {
+                if builder.subject.field == CommitEntryField::Description {
+                    let len = builder.subject.description.chars().count();
+                    builder.subject.cursor = min(builder.subject.cursor + 1, len);
+                }
+            }
+            CommitComposerPane::Body => {
+                let len = builder.body.chars().count();
+                self.input_cursor = min(self.input_cursor + 1, len);
+            }
+            CommitComposerPane::AdditionalEntries => {
+                if builder.additional_entries.is_empty() {
+                    return;
+                }
+                let idx = builder
+                    .selected_additional
+                    .min(builder.additional_entries.len().saturating_sub(1));
+                if builder.additional_entries[idx].field == CommitEntryField::Description {
+                    let len = builder.additional_entries[idx].description.chars().count();
+                    builder.additional_entries[idx].cursor =
+                        min(builder.additional_entries[idx].cursor + 1, len);
+                }
+            }
+        }
     }
 
     pub fn return_to_repo_view(&mut self) {
@@ -1217,7 +1699,7 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
-        self.pending_commit_subject = None;
+        self.clear_pending_commit_builder();
         self.schedule_repo_preview_refresh();
         self.close_fullscreen_diff();
         self.status_message = "Repository view".to_string();
@@ -1235,7 +1717,7 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
-        self.pending_commit_subject = None;
+        self.clear_pending_commit_builder();
         self.status_message = if was_stash_drop_confirmation {
             "Stash drop cancelled".to_string()
         } else if was_discard_confirmation {
@@ -1346,8 +1828,7 @@ impl App {
     pub fn submit_input(&mut self) -> Result<()> {
         match self.input_mode {
             InputMode::None => Ok(()),
-            InputMode::CommitSubject => self.commit_subject_from_input(),
-            InputMode::CommitBody => self.commit_body_from_input(),
+            InputMode::CommitComposer => self.submit_commit_composer(),
             InputMode::AddRepoPath => self.add_repo_from_input(),
             InputMode::NewBranchName => self.create_branch_from_input(),
             InputMode::CreatePullRequestTitle => self.create_pull_request_title_from_input(),
@@ -1593,7 +2074,7 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
-        self.pending_commit_subject = None;
+        self.clear_pending_commit_builder();
         self.clear_history_details();
         self.clear_history_file_history();
         self.history_details_visible = false;
@@ -1739,9 +2220,8 @@ impl App {
 
     pub fn popup_title(&self) -> &'static str {
         match self.input_mode {
-            InputMode::CommitSubject => "Commit subject ([Enter] next, [Esc] cancel)",
-            InputMode::CommitBody => {
-                "Commit body ([Enter] newline, [Up/Down] lines, [Ctrl+S]/[F2] submit, [Esc] cancel)"
+            InputMode::CommitComposer => {
+                "Commit composer ([Tab]/[Shift+Tab] pane, [Ctrl+Left]/[Ctrl+Right] type<->desc, [Ctrl+B] break, [Ctrl+S]/[F2] submit, [Esc] cancel)"
             }
             InputMode::AddRepoPath => "Add repository path ([Enter] submit, [Esc] cancel)",
             InputMode::NewBranchName => "New branch name ([Enter] create/switch, [Esc] cancel)",
@@ -1756,8 +2236,7 @@ impl App {
 
     pub fn popup_input_text(&self) -> Option<&str> {
         match self.input_mode {
-            InputMode::CommitSubject
-            | InputMode::CommitBody
+            InputMode::CommitComposer
             | InputMode::AddRepoPath
             | InputMode::NewBranchName
             | InputMode::CreatePullRequestTitle
@@ -1768,19 +2247,12 @@ impl App {
 
     pub fn popup_input_prefix(&self) -> Option<String> {
         match self.input_mode {
-            InputMode::CommitBody => {
-                let subject = self
-                    .pending_commit_subject
-                    .as_deref()
-                    .unwrap_or("(missing subject)");
-                Some(format!("Subject: {subject}\n\n"))
-            }
+            InputMode::CommitComposer => Some(self.commit_composer_prefix()),
             InputMode::CreatePullRequestBody => {
                 let title = self.pending_pr_title.as_deref().unwrap_or("(missing title)");
                 Some(format!("Title: {title}\n\n"))
             }
-            InputMode::CommitSubject
-            | InputMode::AddRepoPath
+            InputMode::AddRepoPath
             | InputMode::NewBranchName
             | InputMode::CreatePullRequestTitle => Some(String::new()),
             _ => None,
@@ -1827,13 +2299,6 @@ impl App {
                     pending.title
                 )
             }
-            InputMode::CommitBody => {
-                if let Some(subject) = &self.pending_commit_subject {
-                    format!("Subject: {}\n\n{}", subject, self.input_buffer)
-                } else {
-                    self.input_buffer.clone()
-                }
-            }
             InputMode::CreatePullRequestBody => {
                 if let Some(title) = &self.pending_pr_title {
                     format!("Title: {}\n\n{}", title, self.input_buffer)
@@ -1841,7 +2306,7 @@ impl App {
                     self.input_buffer.clone()
                 }
             }
-            InputMode::CommitSubject
+            InputMode::CommitComposer
             | InputMode::AddRepoPath
             | InputMode::NewBranchName
             | InputMode::CreatePullRequestTitle => self.input_buffer.clone(),
@@ -1850,48 +2315,196 @@ impl App {
     }
 
     pub fn input_mode_allows_multiline(&self) -> bool {
-        matches!(self.input_mode, InputMode::CommitBody)
+        matches!(
+            self.input_mode,
+            InputMode::CommitComposer | InputMode::CreatePullRequestBody
+        )
     }
 
-    fn commit_subject_from_input(&mut self) -> Result<()> {
-        let subject = self.input_buffer.trim();
-        if subject.is_empty() {
-            self.status_message = "Commit subject cannot be empty".to_string();
+    fn submit_commit_composer(&mut self) -> Result<()> {
+        let Some(builder) = self.pending_commit_builder.take() else {
+            self.reset_commit_builder_state("Commit composer state is missing; start commit again");
+            return Ok(());
+        };
+
+        let description = builder.subject.description.trim();
+        if description.is_empty() {
+            self.pending_commit_builder = Some(builder);
+            self.status_message = "Commit description cannot be empty".to_string();
             return Ok(());
         }
-        self.pending_commit_subject = Some(subject.to_string());
-        self.input_mode = InputMode::CommitBody;
-        self.input_buffer.clear();
-        self.input_cursor = 0;
-        self.status_message = "Enter commit body (optional), [Ctrl+S] or [F2] to commit".to_string();
-        Ok(())
-    }
 
-    fn commit_body_from_input(&mut self) -> Result<()> {
-        let Some(subject) = self.pending_commit_subject.take() else {
-            self.input_mode = InputMode::None;
-            self.input_buffer.clear();
-            self.input_cursor = 0;
-            self.status_message = "Commit subject is missing; start commit again".to_string();
-            return Ok(());
-        };
+        let selected_type = builder.allowed_types.get(builder.subject.type_idx).cloned().ok_or_else(|| {
+            anyhow!("Commit subject type selection is invalid; reopen commit composer.")
+        })?;
+        let marker = if builder.subject.breaking { "!" } else { "" };
+        let subject = format!("{selected_type}{marker}: {description}");
 
-        let body = self.input_buffer.trim_end().to_string();
-        let body_option = if body.trim().is_empty() {
+        let mut footer_entries = Vec::new();
+        for entry in &builder.additional_entries {
+            let trimmed = entry.description.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let change_type = builder.allowed_types.get(entry.type_idx).cloned().ok_or_else(|| {
+                anyhow!("Additional entry type selection is invalid; reopen commit composer.")
+            })?;
+            let is_releasable = builder
+                .policy
+                .releasable_types
+                .iter()
+                .any(|value| value == &change_type);
+            if !builder.has_guarded_changes && is_releasable {
+                self.pending_commit_builder = Some(builder);
+                self.status_message = format!(
+                    "Entry type '{}' requires guarded path changes.",
+                    change_type
+                );
+                return Ok(());
+            }
+            if entry.breaking && !is_releasable {
+                self.pending_commit_builder = Some(builder);
+                self.status_message = format!(
+                    "Type '{}' cannot be marked breaking.",
+                    change_type
+                );
+                return Ok(());
+            }
+
+            let entry_marker = if entry.breaking { "!" } else { "" };
+            footer_entries.push(format!("{change_type}{entry_marker}: {trimmed}"));
+        }
+
+        let mut body_lines = Vec::new();
+        if !builder.body.trim().is_empty() {
+            body_lines.extend(builder.body.lines().map(|line| line.to_string()));
+        }
+        if !footer_entries.is_empty() {
+            if !body_lines.is_empty() {
+                body_lines.push(String::new());
+            }
+            body_lines.extend(footer_entries);
+        }
+
+        let body_option = if body_lines.is_empty() {
             None
         } else {
-            Some(body)
+            Some(body_lines.join("\n"))
         };
+
         let root = self.current_repo_root()?.to_path_buf();
         self.input_mode = InputMode::None;
         self.input_buffer.clear();
         self.input_cursor = 0;
-        self.request_write_op(
-            "Creating commit",
-            AsyncWriteOp::Commit,
-            move || git::commit(&root, &subject, body_option.as_deref()),
-        );
+        self.request_write_op("Creating commit", AsyncWriteOp::Commit, move || {
+            git::commit(&root, &subject, body_option.as_deref())
+        });
         Ok(())
+    }
+
+    fn reset_commit_builder_state(&mut self, message: &str) {
+        self.clear_pending_commit_builder();
+        self.input_mode = InputMode::None;
+        self.input_buffer.clear();
+        self.input_cursor = 0;
+        self.status_message = message.to_string();
+    }
+
+    fn clear_pending_commit_builder(&mut self) {
+        self.pending_commit_builder = None;
+    }
+
+    fn commit_composer_prefix(&self) -> String {
+        let Some(builder) = &self.pending_commit_builder else {
+            return "Commit builder unavailable. Press [Esc] and retry commit.".to_string();
+        };
+        let mut lines = vec![
+            "Fullscreen commit composer".to_string(),
+            "Focus: [Tab]/[Shift+Tab] pane | [Up]/[Down] additional entry or type option".to_string(),
+            "Entry field: [Ctrl+Left]/[Ctrl+Right] (Type <-> Description)".to_string(),
+            "Type dropdown: type to filter, [Up]/[Down] move selection".to_string(),
+            "Breaking: [Ctrl+B]".to_string(),
+            "Text cursor: [Left]/[Right] in active pane".to_string(),
+            "Additional entries: [Ctrl+N] add | [Ctrl+D] remove".to_string(),
+            "Submit: [Ctrl+S]/[F2]".to_string(),
+            format!("Allowed commit types: {}", builder.allowed_types.join(", ")),
+        ];
+        if !builder.has_guarded_changes && !builder.policy.releasable_types.is_empty() {
+            lines.push(format!(
+                "Releasable types blocked (no guarded path changes): {}",
+                builder.policy.releasable_types.join(", ")
+            ));
+        }
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    pub fn commit_composer_state(&self) -> Option<CommitComposerViewState> {
+        let builder = self.pending_commit_builder.as_ref()?;
+        let subject = commit_composer_entry_label(builder, &builder.subject);
+        let additional_entries = if builder.additional_entries.is_empty() {
+            vec!["(no additional entries)".to_string()]
+        } else {
+            builder
+                .additional_entries
+                .iter()
+                .map(|entry| commit_composer_entry_label(builder, entry))
+                .collect()
+        };
+        let additional_field = if builder.additional_entries.is_empty() {
+            CommitEntryField::Description
+        } else {
+            let idx = builder
+                .selected_additional
+                .min(builder.additional_entries.len().saturating_sub(1));
+            builder.additional_entries[idx].field
+        };
+        let subject_type_filter = builder.subject.type_filter.clone();
+        let subject_type_options =
+            filtered_type_names(&builder.allowed_types, &builder.subject.type_filter);
+        let subject_selected_type = builder
+            .allowed_types
+            .get(builder.subject.type_idx)
+            .cloned()
+            .unwrap_or_default();
+        let (additional_type_filter, additional_type_options, additional_selected_type) =
+            if builder.additional_entries.is_empty() {
+                (
+                    String::new(),
+                    builder.allowed_types.clone(),
+                    String::new(),
+                )
+            } else {
+                let idx = builder
+                    .selected_additional
+                    .min(builder.additional_entries.len().saturating_sub(1));
+                let filter = builder.additional_entries[idx].type_filter.clone();
+                let options = filtered_type_names(&builder.allowed_types, &filter);
+                let selected = builder
+                    .allowed_types
+                    .get(builder.additional_entries[idx].type_idx)
+                    .cloned()
+                    .unwrap_or_default();
+                (filter, options, selected)
+            };
+        Some(CommitComposerViewState {
+            focus: builder.focus,
+            subject,
+            body: builder.body.clone(),
+            additional_entries,
+            selected_additional: builder
+                .selected_additional
+                .min(builder.additional_entries.len().saturating_sub(1)),
+            has_additional_entries: !builder.additional_entries.is_empty(),
+            subject_field: builder.subject.field,
+            additional_field,
+            subject_type_filter,
+            subject_type_options,
+            additional_type_filter,
+            additional_type_options,
+            subject_selected_type,
+            additional_selected_type,
+        })
     }
 
     fn add_repo_from_input(&mut self) -> Result<()> {
@@ -2057,7 +2670,7 @@ impl App {
         self.pending_discard = None;
         self.pending_pr_merge = None;
         self.pending_pr_title = None;
-        self.pending_commit_subject = None;
+        self.clear_pending_commit_builder();
         self.clear_pr_status_summary();
         self.snapshot_inflight = None;
         self.snapshot_completion_message = None;
@@ -3539,6 +4152,188 @@ fn pull_request_merge_method_label(method: GitPullRequestMergeMethod) -> &'stati
         GitPullRequestMergeMethod::Merge => "merge",
         GitPullRequestMergeMethod::Squash => "squash",
         GitPullRequestMergeMethod::Rebase => "rebase",
+    }
+}
+
+fn commit_allowed_types(policy: &CommitPolicy, has_guarded_changes: bool) -> Vec<String> {
+    if has_guarded_changes {
+        return policy.all_types.clone();
+    }
+
+    policy
+        .all_types
+        .iter()
+        .filter(|value| !policy.releasable_types.iter().any(|item| item == *value))
+        .cloned()
+        .collect()
+}
+
+fn staged_paths_match_guarded_prefixes(
+    staged_entries: &[crate::git::FileEntry],
+    policy: &CommitPolicy,
+) -> bool {
+    if policy.guarded_prefixes.is_empty() {
+        return false;
+    }
+
+    let normalized_prefixes = policy
+        .guarded_prefixes
+        .iter()
+        .map(|prefix| normalize_for_prefix_match(prefix))
+        .filter(|prefix| !prefix.is_empty())
+        .collect::<Vec<_>>();
+
+    staged_entries.iter().any(|entry| {
+        let path = normalize_for_prefix_match(&entry.path);
+        normalized_prefixes
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
+    })
+}
+
+fn normalize_for_prefix_match(value: &str) -> String {
+    value.replace('\\', "/").trim().to_ascii_lowercase()
+}
+
+fn insert_char_at_cursor(buffer: &mut String, cursor: &mut usize, ch: char) {
+    let mut chars = buffer.chars().collect::<Vec<_>>();
+    let idx = (*cursor).min(chars.len());
+    chars.insert(idx, ch);
+    *cursor = idx + 1;
+    *buffer = chars.into_iter().collect();
+}
+
+fn backspace_char_at_cursor(buffer: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let mut chars = buffer.chars().collect::<Vec<_>>();
+    let idx = (*cursor).min(chars.len());
+    if idx == 0 {
+        return;
+    }
+    chars.remove(idx - 1);
+    *cursor = idx - 1;
+    *buffer = chars.into_iter().collect();
+}
+
+fn commit_composer_active_entry_mut(
+    builder: &mut PendingCommitBuilder,
+) -> Option<&mut ChangeEntryDraft> {
+    match builder.focus {
+        CommitComposerPane::Subject => Some(&mut builder.subject),
+        CommitComposerPane::Body => None,
+        CommitComposerPane::AdditionalEntries => {
+            if builder.additional_entries.is_empty() {
+                return None;
+            }
+            let idx = builder
+                .selected_additional
+                .min(builder.additional_entries.len().saturating_sub(1));
+            builder.additional_entries.get_mut(idx)
+        }
+    }
+}
+
+fn commit_composer_active_entry_is_type(builder: &PendingCommitBuilder) -> bool {
+    match builder.focus {
+        CommitComposerPane::Subject => builder.subject.field == CommitEntryField::Type,
+        CommitComposerPane::Body => false,
+        CommitComposerPane::AdditionalEntries => {
+            if builder.additional_entries.is_empty() {
+                return false;
+            }
+            let idx = builder
+                .selected_additional
+                .min(builder.additional_entries.len().saturating_sub(1));
+            builder.additional_entries[idx].field == CommitEntryField::Type
+        }
+    }
+}
+
+fn filtered_type_indices(allowed_types: &[String], filter: &str) -> Vec<usize> {
+    if filter.trim().is_empty() {
+        return (0..allowed_types.len()).collect();
+    }
+    let needle = filter.to_ascii_lowercase();
+    allowed_types
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| item.to_ascii_lowercase().contains(&needle).then_some(idx))
+        .collect()
+}
+
+fn filtered_type_names(allowed_types: &[String], filter: &str) -> Vec<String> {
+    filtered_type_indices(allowed_types, filter)
+        .into_iter()
+        .filter_map(|idx| allowed_types.get(idx).cloned())
+        .collect()
+}
+
+fn apply_filter_to_entry(allowed_types: &[String], entry: &mut ChangeEntryDraft) {
+    let filtered = filtered_type_indices(allowed_types, &entry.type_filter);
+    if let Some(idx) = filtered.first() {
+        entry.type_idx = *idx;
+    }
+}
+
+fn commit_composer_entry_label(builder: &PendingCommitBuilder, entry: &ChangeEntryDraft) -> String {
+    let change_type = builder
+        .allowed_types
+        .get(entry.type_idx)
+        .map(String::as_str)
+        .unwrap_or("(missing type)");
+    let marker = if entry.breaking { "!" } else { "" };
+    let description = if entry.description.trim().is_empty() {
+        "(empty description)"
+    } else {
+        entry.description.trim()
+    };
+    format!("{change_type}{marker}: {description}")
+}
+
+fn ensure_breaking_valid(builder: &mut PendingCommitBuilder) {
+    match builder.focus {
+        CommitComposerPane::Subject => {
+            let is_releasable = builder
+                .allowed_types
+                .get(builder.subject.type_idx)
+                .map(|selected_type| {
+                    builder
+                        .policy
+                        .releasable_types
+                        .iter()
+                        .any(|value| value == selected_type)
+                })
+                .unwrap_or(false);
+            if !is_releasable {
+                builder.subject.breaking = false;
+            }
+        }
+        CommitComposerPane::Body => {}
+        CommitComposerPane::AdditionalEntries => {
+            if builder.additional_entries.is_empty() {
+                return;
+            }
+            let idx = builder
+                .selected_additional
+                .min(builder.additional_entries.len().saturating_sub(1));
+            let type_idx = builder.additional_entries[idx].type_idx;
+            let is_releasable = builder
+                .allowed_types
+                .get(type_idx)
+                .map(|selected_type| {
+                    builder
+                        .policy
+                        .releasable_types
+                        .iter()
+                        .any(|value| value == selected_type)
+                })
+                .unwrap_or(false);
+            if !is_releasable {
+                builder.additional_entries[idx].breaking = false;
+            }
+        }
     }
 }
 

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "all_types": [
+    "feat",
+    "fix",
+    "docs",
+    "chore",
+    "refactor",
+    "test",
+    "build",
+    "ci",
+    "perf",
+    "revert"
+  ],
+  "releasable_types": [
+    "feat",
+    "fix"
+  ],
+  "guarded_prefixes": [
+    "src/"
+  ]
+}

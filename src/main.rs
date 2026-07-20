@@ -1,5 +1,6 @@
 // testing status checks for release
 mod app;
+mod commit_config;
 mod diagnostics;
 mod git;
 mod repo_registry;
@@ -71,6 +72,42 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
         if app.in_input_mode() {
             let mut action_result: Option<Result<()>> = None;
             match app.input_mode {
+                InputMode::CommitComposer => match key.code {
+                    KeyCode::Char('?') => app.toggle_help(),
+                    KeyCode::Esc => app.cancel_input(),
+                    KeyCode::Tab => app.commit_composer_focus_next(),
+                    KeyCode::BackTab => app.commit_composer_focus_prev(),
+                    KeyCode::Left if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.commit_composer_switch_entry_field_prev()
+                    }
+                    KeyCode::Right if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.commit_composer_switch_entry_field_next()
+                    }
+                    KeyCode::Left => app.commit_composer_cursor_left(),
+                    KeyCode::Right => app.commit_composer_cursor_right(),
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.commit_composer_toggle_breaking()
+                    }
+                    KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.commit_composer_add_entry()
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.commit_composer_remove_selected_entry()
+                    }
+                    KeyCode::Up => app.commit_composer_select_prev_entry(),
+                    KeyCode::Down => app.commit_composer_select_next_entry(),
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        action_result = Some(app.submit_input())
+                    }
+                    KeyCode::Enter => app.commit_composer_insert_newline(),
+                    KeyCode::F(2) => action_result = Some(app.submit_input()),
+                    KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        action_result = Some(app.submit_input())
+                    }
+                    KeyCode::Backspace => app.commit_composer_backspace(),
+                    KeyCode::Char(ch) => app.commit_composer_push_char(ch),
+                    _ => {}
+                },
                 InputMode::ConfirmDiscard => match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         action_result = Some(app.confirm_discard_selected())
@@ -93,6 +130,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
                     _ => {}
                 },
                 _ => match key.code {
+                    KeyCode::Char('?') => app.toggle_help(),
                     KeyCode::Esc => app.cancel_input(),
                     KeyCode::Enter
                         if app.input_mode_allows_multiline()
@@ -121,7 +159,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, app: &mut App
                     }
                     KeyCode::Home => app.move_input_cursor_home(),
                     KeyCode::End => app.move_input_cursor_end(),
-                    KeyCode::Tab => action_result = Some(app.autocomplete_input()),
+                    KeyCode::Tab if app.input_mode == InputMode::AddRepoPath => {
+                        action_result = Some(app.autocomplete_input())
+                    }
                     KeyCode::Char(ch) => app.push_input_char(ch),
                     _ => {}
                 },

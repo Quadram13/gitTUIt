@@ -2,7 +2,7 @@
 
 gitTUIt is a terminal UI for Git/Github workflows. I am currently using this for personal projects, as well as work tasks under specific conditions. The TUI works in it's current state for my purposes, but is still under development and may experience large/breaking changes, so use this at your own risk.
 
-At this stage, I have started adding release/version-control workflows to this repo. The end goal is to fold these scripts/cargo-make tasks into future plugins.
+At this stage, I have started adding release/version-control workflows to this repo. The original plan was to port these into external plugins, but the scope of the potential refactor is way too large. 
 
 ## Current Features
 
@@ -34,12 +34,12 @@ Currently, this TUI can replace(at least for me) the functionality of Github Des
 
 A concrete list of upcoming changes(in order):
 
-* refactor TUI for Lua plugins/customization
-    - potential plugins for my current use include commit message building with conventional commits and merging release followup PRs from github actions
+* refactor TUI for configurable features
+    - add optional features like commit message building with conventional commits
 
-    - themes/colors/keybinds/others may be a mix of config files and plugins
+    - themes/colors/keybinds/others
 
-    - other ideas for plugins/customization will be added here as they come up
+    - keep configuration in config files for now, consider larger refactor for external plugins when i feel like it
 
 * changelog/packaging/release setup(in progress)
     - basic github actions workflow structure is in place

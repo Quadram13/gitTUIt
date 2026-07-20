@@ -6,7 +6,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{App, FocusPane, HistoryFocusPane, InputMode, Screen};
+use crate::app::{
+    App, CommitComposerPane, CommitEntryField, FocusPane, HistoryFocusPane, InputMode, Screen,
+};
 use crate::tree::changed_files_tree::TreeRowKind;
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -24,7 +26,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_body(frame, app, layout[1]);
     draw_footer(frame, app, layout[2]);
 
-    if app.in_input_mode() {
+    if app.in_input_mode() && app.input_mode != InputMode::CommitComposer {
         draw_commit_popup(frame, app);
     }
     if app.help_visible {
@@ -95,6 +97,10 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         draw_fullscreen_diff(frame, app, area);
         return;
     }
+    if app.input_mode == InputMode::CommitComposer {
+        draw_commit_composer_fullscreen(frame, app, area);
+        return;
+    }
     if app.screen == Screen::RepoPicker {
         draw_repo_picker(frame, app, area);
         return;
@@ -129,6 +135,196 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     }
 
     draw_repo_status_view(frame, app, area);
+}
+
+fn draw_commit_composer_fullscreen(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.commit_composer_state() else {
+        let fallback = Paragraph::new("Commit composer state unavailable.")
+            .block(Block::default().borders(Borders::ALL).title("Commit Composer"));
+        frame.render_widget(fallback, area);
+        return;
+    };
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(33),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+        ])
+        .split(area);
+
+    let subject_border = if state.focus == CommitComposerPane::Subject {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let body_border = if state.focus == CommitComposerPane::Body {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    let additional_border = if state.focus == CommitComposerPane::AdditionalEntries {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+
+    let subject_type_active =
+        state.focus == CommitComposerPane::Subject && state.subject_field == CommitEntryField::Type;
+    let subject_desc_active = state.focus == CommitComposerPane::Subject
+        && state.subject_field == CommitEntryField::Description;
+    let subject_outer = Block::default()
+        .borders(Borders::ALL)
+        .title("Subject Entry")
+        .border_style(subject_border);
+    let subject_inner = subject_outer.inner(cols[0]);
+    frame.render_widget(subject_outer, cols[0]);
+    let subject_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(3)])
+        .split(subject_inner);
+    render_type_selector_box(
+        frame,
+        subject_sections[0],
+        if subject_type_active {
+            "Type Selector (active)"
+        } else {
+            "Type Selector"
+        },
+        subject_type_active,
+        &state.subject_type_filter,
+        &state.subject_type_options,
+        &state.subject_selected_type,
+    );
+    let subject_desc_box = Paragraph::new(state.subject.clone())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if subject_desc_active {
+                    "Description (active)"
+                } else {
+                    "Description"
+                })
+                .border_style(if subject_desc_active {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(subject_desc_box, subject_sections[1]);
+
+    let body = Paragraph::new(state.body.clone())
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Freeform Body")
+                .border_style(body_border),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(body, cols[1]);
+
+    let additional_type_active = state.focus == CommitComposerPane::AdditionalEntries
+        && state.additional_field == CommitEntryField::Type;
+    let additional_desc_active = state.focus == CommitComposerPane::AdditionalEntries
+        && state.additional_field == CommitEntryField::Description;
+    let additional_outer = Block::default()
+        .borders(Borders::ALL)
+        .title("Additional Change Entries")
+        .border_style(additional_border);
+    let additional_inner = additional_outer.inner(cols[2]);
+    frame.render_widget(additional_outer, cols[2]);
+    let additional_sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(9), Constraint::Min(4)])
+        .split(additional_inner);
+    render_type_selector_box(
+        frame,
+        additional_sections[0],
+        if additional_type_active {
+            "Type Selector (active)"
+        } else {
+            "Type Selector"
+        },
+        additional_type_active,
+        &state.additional_type_filter,
+        &state.additional_type_options,
+        &state.additional_selected_type,
+    );
+    let additional_items = state
+        .additional_entries
+        .iter()
+        .map(|entry| ListItem::new(entry.clone()))
+        .collect::<Vec<_>>();
+    let additional = List::new(additional_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if additional_desc_active {
+                    "Entries (active)"
+                } else {
+                    "Entries"
+                })
+                .border_style(if additional_desc_active {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    Style::default()
+                }),
+        )
+        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ");
+    let mut additional_state = ListState::default();
+    if state.has_additional_entries {
+        additional_state.select(Some(state.selected_additional));
+    }
+    frame.render_stateful_widget(additional, additional_sections[1], &mut additional_state);
+}
+
+fn render_type_selector_box(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    is_active: bool,
+    filter: &str,
+    options: &[String],
+    selected_type: &str,
+) {
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(if is_active {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default()
+        });
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    let filter_text = if filter.is_empty() { "(none)" } else { filter };
+    let filter_line = Paragraph::new(format!("Filter: {filter_text}"));
+    frame.render_widget(filter_line, rows[0]);
+    let items = if options.is_empty() {
+        vec![ListItem::new("(no matches)")]
+    } else {
+        options
+            .iter()
+            .map(|option| ListItem::new(option.clone()))
+            .collect::<Vec<_>>()
+    };
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::DarkGray))
+        .highlight_symbol("> ");
+    let mut list_state = ListState::default();
+    if !options.is_empty()
+        && let Some(idx) = options.iter().position(|option| option == selected_type)
+    {
+        list_state.select(Some(idx));
+    }
+    frame.render_stateful_widget(list, rows[1], &mut list_state);
 }
 
 fn draw_repo_picker(frame: &mut Frame, app: &App, area: Rect) {
@@ -634,9 +830,14 @@ fn split_master_detail(area: Rect, master_percent: u16, detail_percent: u16) -> 
 }
 
 fn draw_footer(frame: &mut Frame, app: &App, _area: Rect) {
+    let keybind_line = if app.input_mode == InputMode::CommitComposer {
+        "[Tab]/[Shift+Tab] pane | [Ctrl+Left/Right] type<->desc | [Type mode: type + Up/Down] | [Ctrl+B] break | [Ctrl+N]/[Ctrl+D] entry | [Ctrl+S]/[F2] submit | [Esc] cancel | [?] help"
+    } else {
+        "[?] help | [q] quit | [r] refresh | [L] log"
+    };
     let lines = vec![
         Line::from(app.status_message.clone()),
-        Line::from("[?] help | [q] quit | [r] refresh | [L] log"),
+        Line::from(keybind_line),
     ];
 
     let footer = Paragraph::new(Text::from(lines))
@@ -698,7 +899,9 @@ fn colorize_diff_line(line: String) -> Line<'static> {
 
 fn draw_commit_popup(frame: &mut Frame, app: &App) {
     let popup = match app.input_mode {
-        InputMode::CommitBody => centered_rect_with_min(92, 45, frame.area(), 56, 10),
+        InputMode::CommitComposer | InputMode::CreatePullRequestBody => {
+            centered_rect_with_min(92, 45, frame.area(), 56, 10)
+        }
         _ => centered_rect_with_min(82, 24, frame.area(), 52, 5),
     };
     let title = truncate_for_width(app.popup_title(), popup.width.saturating_sub(4) as usize);
